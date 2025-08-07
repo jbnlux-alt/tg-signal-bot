@@ -1,6 +1,7 @@
-import os, logging
+import os, logging, asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from scanner import scanner_loop  # <-- импорт фонового сканера
 
 TOKEN = os.environ.get("TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID", "0"))
@@ -15,13 +16,14 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot online. Webhook mode.")
+    await update.message.reply_text("Bot online. Webhook + Scanner mode.")
 
 async def on_startup(app: Application):
-    # опционально шлём стартовое уведомление
+    # Запускаем фоновый сканер
     if CHAT_ID:
+        asyncio.create_task(scanner_loop(app.bot, CHAT_ID))
         try:
-            await app.bot.send_message(chat_id=CHAT_ID, text="🔔 Webhook bot on Render: startup OK")
+            await app.bot.send_message(chat_id=CHAT_ID, text="🔔 Webhook bot: scanner started")
         except Exception as e:
             logger.exception("Failed to send startup message: %s", e)
 
@@ -32,21 +34,20 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("start", start_cmd))
+    app.post_init = on_startup
 
-    # Собираем URL вебхука, если Render уже выдал публичный адрес
     webhook_url = None
     if WEBHOOK_BASE:
         webhook_url = WEBHOOK_BASE.rstrip("/") + f"/webhook/{WEBHOOK_SECRET}"
         logger.info("Using webhook_url: %s", webhook_url)
     else:
-        logger.warning("WEBHOOK_BASE/RENDER_EXTERNAL_URL not set yet. Set it or redeploy after URL appears.")
+        logger.warning("WEBHOOK_BASE/RENDER_EXTERNAL_URL not set yet. Redeploy after URL appears.")
 
-    # В 21.x нужно использовать url_path вместо webhook_path
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=f"/webhook/{WEBHOOK_SECRET}",
-        webhook_url=webhook_url,          # можно None на первом запуске; задастся при следующем
+        webhook_url=webhook_url,
         secret_token=WEBHOOK_SECRET,
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
@@ -54,4 +55,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
