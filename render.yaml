@@ -1,6 +1,7 @@
+
 services:
-  - type: worker
-    name: telegram-bot-worker
+  - type: web
+    name: telegram-bot-webhook
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
@@ -9,4 +10,8 @@ services:
       - key: TOKEN
         sync: false
       - key: CHAT_ID
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: WEBHOOK_BASE
         sync: false
