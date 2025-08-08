@@ -50,6 +50,9 @@ STATS_FILE         = os.getenv("STATS_FILE","stats.json")
 FUTURES_SEED       = [s.strip().upper() for s in os.getenv("FUTURES_SEED","").split(",") if s.strip()]
 SYMBOLS_CACHE_FILE = os.getenv("SYMBOLS_CACHE_FILE","futures_usdt_cache.json")
 
+# Алиасы/делисты (можно расширять в ENV: ALIASES="MATICUSDT=POLUSDT;XYZUSDT=REMOVE")
+ALIASES_RAW = os.getenv("ALIASES", "MATICUSDT=POLUSDT;FTMUSDT=REMOVE")
+
 # ---------- API ----------
 SPOT_API      = "https://api.mexc.com/api/v3"
 CONTRACT_API  = "https://contract.mexc.com/api/v1/contract"
@@ -57,7 +60,7 @@ QUOTE         = "USDT"  # для ссылок/маппинга
 
 HTTP_TIMEOUT  = aiohttp.ClientTimeout(total=15)
 HEADERS       = {
-    "User-Agent": "Mozilla/5.0 (compatible; TradeSignalFilterBot/2.1; +render)",
+    "User-Agent": "Mozilla/5.0 (compatible; TradeSignalFilterBot/2.2; +render)",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://www.mexc.com",
@@ -76,19 +79,37 @@ _next_fetch_at = 0.0  # чтобы не долбить API после неуда
 # Учёт «открытых» сигналов (для лимитов)
 _open: List[dict] = []  # {sym, ts, notional}
 
-def _prune_open(now: float, ttl: int = 6*3600):
-    global _open
-    _open = [x for x in _open if now - x["ts"] < ttl]
+# Авто-карантин символов без данных
+FAIL_LIMIT = 3
+BAD_SYMBOL_TTL_SEC = 24 * 3600
+_fail_cnt: dict[str, int] = {}
+_bad_until: dict[str, float] = {}
 
-def _open_count_total() -> int:
-    return len(_open)
+# ---------- АЛИАСЫ / ДЕЛИСТЫ ----------
+def _parse_aliases(raw: str) -> dict:
+    m = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            a, b = part.split("=", 1)
+            m[a.strip().upper()] = b.strip().upper()
+        else:
+            m[part.upper()] = part.upper()
+    return m
 
-def _open_count_symbol(sym: str) -> int:
-    return sum(1 for x in _open if x["sym"] == sym)
+ALIASES = _parse_aliases(ALIASES_RAW)
 
-def _open_margin_bps() -> float:
-    total_notional = sum(x["notional"] for x in _open)
-    return 10000.0 * total_notional / max(1e-9, DEPOSIT_USDT)
+def _canon(sym: str) -> Optional[str]:
+    s = sym.strip().upper()
+    # поддержка формы в семенах: XXXUSDT:REMOVE
+    if s.endswith(":REMOVE"):
+        return None
+    mapped = ALIASES.get(s, s)
+    if mapped in ("REMOVE", "DELISTED", "-", "NONE", ""):
+        return None
+    return mapped
 
 # ---------- УТИЛЫ ----------
 async def _get_json(session: aiohttp.ClientSession, url: str, **params):
@@ -121,6 +142,20 @@ def _save_cached_syms(syms: List[str]) -> None:
             json.dump(sorted(set(syms)), f, ensure_ascii=False)
     except Exception:
         pass
+
+def _prune_open(now: float, ttl: int = 6*3600):
+    global _open
+    _open = [x for x in _open if now - x["ts"] < ttl]
+
+def _open_count_total() -> int:
+    return len(_open)
+
+def _open_count_symbol(sym: str) -> int:
+    return sum(1 for x in _open if x["sym"] == sym)
+
+def _open_margin_bps() -> float:
+    total_notional = sum(x["notional"] for x in _open)
+    return 10000.0 * total_notional / max(1e-9, DEPOSIT_USDT)
 
 # ---------- ROBUST KLINES (спот или фьючерсы, что доступно) ----------
 _INTERV_SPOT = {
@@ -161,13 +196,25 @@ async def _klines_contract(session, sym: str, base_interval: str, limit: int):
         return []
 
 async def _klines_any(session, sym: str, base_interval: str, limit: int):
+    # карантин по «битым» символам
+    now = time.time()
+    if _bad_until.get(sym, 0.0) > now:
+        return []
     data = await _klines_spot(session, sym, base_interval, limit)
     if data:
+        _fail_cnt[sym] = 0
         return data
     data = await _klines_contract(session, sym, base_interval, limit)
     if data:
+        _fail_cnt[sym] = 0
         return data
-    log.warning("No klines from spot/contract for %s %s (limit=%s)", sym, base_interval, limit)
+    # не получили ниоткуда — увеличиваем счётчик и при необходимости уходим в карантин
+    _fail_cnt[sym] = _fail_cnt.get(sym, 0) + 1
+    if _fail_cnt[sym] >= FAIL_LIMIT:
+        _bad_until[sym] = now + BAD_SYMBOL_TTL_SEC
+        log.warning("No klines from spot/contract for %s %s (limit=%s). Quarantine 24h.", sym, base_interval, limit)
+    else:
+        log.warning("No klines from spot/contract for %s %s (limit=%s)", sym, base_interval, limit)
     return []
 
 # ---------- СТАБИЛЬНЫЙ УНИВЕРС ПЕРПЕТУАЛОВ С КЭШЕМ/ФОЛЛБЭКАМИ ----------
@@ -195,9 +242,9 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
     if not _fut_syms:
         disk = _load_cached_syms()
         if disk:
-            _fut_syms = disk
+            _fut_syms = [x for x in (_canon(y) for y in disk) if x]
         elif FUTURES_SEED:
-            _fut_syms = FUTURES_SEED[:]
+            _fut_syms = [x for x in (_canon(y) for y in FUTURES_SEED) if x]
 
     new_list: List[str] = []
 
@@ -247,6 +294,9 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
         except Exception as e:
             log.warning("fallback spot->contract failed: %s", e)
 
+    # применяем алиасы/делисты к new_list
+    new_list = [x for x in (_canon(y) for y in new_list) if x]
+
     # 3) если снова пусто — не обнуляем, держим кэш/семена, ставим бэкофф
     if not new_list:
         if _fut_syms:
@@ -255,12 +305,12 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
             return _fut_syms, False
         disk = _load_cached_syms()
         if disk:
-            _fut_syms = disk
+            _fut_syms = [x for x in (_canon(y) for y in disk) if x]
             _next_fetch_at = now + 300 + random.randint(0,60)
             log.warning("APIs empty; loaded %d symbols from disk cache. Backoff 5m.", len(_fut_syms))
             return _fut_syms, False
         if FUTURES_SEED:
-            _fut_syms = FUTURES_SEED[:]
+            _fut_syms = [x for x in (_canon(y) for y in FUTURES_SEED) if x]
             _next_fetch_at = now + 300 + random.randint(0,60)
             log.warning("APIs empty; using FUTURES_SEED=%d symbols. Backoff 5m.", len(_fut_syms))
             return _fut_syms, False
@@ -512,9 +562,12 @@ async def scanner_loop(bot, chat_id: int):
                 if not await btc_ok(session):
                     await asyncio.sleep(SCAN_INTERVAL); continue
 
-                async def worker(sym: str):
+                async def worker(sym_in: str):
                     async with sem:
                         try:
+                            # алиасы/делисты: на всякий случай нормализуем и тут
+                            sym = _canon(sym_in) or sym_in
+
                             # Возраст / тренд / риск дневных пампов / VIP
                             if not await coin_age_ok(session, sym): return
                             risk_pumps = await daily_pump_risk(session, sym)
@@ -565,9 +618,9 @@ async def scanner_loop(bot, chat_id: int):
                             vol_str  = f"~${round((vol24 or 0)/1e6, 2)}M" if vol24 else "—"
                             fund_str = f"{fund*100:.4f}%" if fund is not None else "n/a"
 
-                            # Рендер графика
+                            # Рендер графика (с уровнями + ENTRY/STOP/TAKE + swing-high метки)
                             try:
-                                img = render_chart_image(sym, m1)
+                                img = render_chart_image(sym, m1, levels=srl, entry=entry, stop=stop, take=take, mark_swings=True)
                             except Exception:
                                 log.exception("chart render %s", sym)
                                 img = None
@@ -611,7 +664,7 @@ async def scanner_loop(bot, chat_id: int):
                                                        reply_markup=kb, parse_mode=ParseMode.HTML,
                                                        disable_web_page_preview=True)
                         except Exception:
-                            log.exception("worker error %s", sym)
+                            log.exception("worker error %s", sym_in)
 
                 await asyncio.gather(*(worker(s) for s in syms))
 
