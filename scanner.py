@@ -15,7 +15,7 @@ COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "900"))  # 15 минут по ум�
 _last_sent: dict[str, float] = {}
 _last_sent_lock = asyncio.Lock()
 
-# ---------- ENV (настраивается в Render → Environment) ----------
+# ---------- ENV (Render → Environment) ----------
 PUMP_THRESHOLD     = float(os.getenv("PUMP_THRESHOLD", "0.07"))     # 7% за 1м
 RSI_MIN            = float(os.getenv("RSI_MIN", "70"))              # порог RSI
 SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "60"))          # сек между итерациями
@@ -24,56 +24,104 @@ QUOTE              = os.getenv("QUOTE_FILTER", "USDT")              # котир
 MAX_CONCURRENCY    = int(os.getenv("MAX_CONCURRENCY", "8"))         # параллельные запросы
 
 MEXC_API = "https://api.mexc.com/api/v3"
+OPEN_API = "https://www.mexc.com/open/api/v2"
 
-# ---------- Кэш списка пар ----------
+# ---------- Кэш списка пар и бэк-офф ----------
 _symbols_cache: list[str] = []
 _last_reload: float = 0.0
+_next_pairs_fetch_at: float = 0.0   # не дёргать API раньше этого времени
 _sent_startup_ping: bool = False
+
+_HTTP_HEADERS = {
+    "User-Agent": "TradeSignalFilterBot/1.0 (+render)",
+    "Accept": "application/json",
+}
 
 # ---------- HTTP helper ----------
 async def _fetch_json(session: aiohttp.ClientSession, url: str, **params):
-    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+    async with session.get(url, params=params, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15)) as r:
         r.raise_for_status()
-        return await r.json()
+        return await r.json(content_type=None)  # иногда content-type ломают
 
-# ---------- Загрузка всех USDT-пар MEXC (с бэк-оффом и без затирания кэша пустыми данными) ----------
+# ---------- Загрузка всех USDT-пар MEXC (с бэк-оффом и фолбэками) ----------
 async def fetch_symbols() -> tuple[list[str], bool]:
     """
     Возвращает (symbols, refreshed_now).
+    Бэк-офф работает даже при пустом кэше. Фолбэки: /exchangeInfo → /ticker/price → /open/api/v2/market/symbols.
     refreshed_now=True — только если кэш реально обновился валидными данными.
-    При пустом ответе/ошибке кэш сохраняем и ставим бэк-офф 5 минут.
     """
-    global _symbols_cache, _last_reload
+    global _symbols_cache, _last_reload, _next_pairs_fetch_at
     now = time.time()
 
-    # ещё рано обновлять — отдаем кэш
-    if _symbols_cache and (now - _last_reload) < SYMBOL_REFRESH_SEC:
+    # соблюдаем окно, даже если кэш пуст
+    if now < _next_pairs_fetch_at:
         return _symbols_cache, False
 
+    # если недавно обновляли — не трогаем
+    if (now - _last_reload) < SYMBOL_REFRESH_SEC and _symbols_cache:
+        return _symbols_cache, False
+
+    symbols: list[str] = []
     try:
-        async with aiohttp.ClientSession() as s:
-            info = await _fetch_json(s, f"{MEXC_API}/exchangeInfo")
-        syms: list[str] = []
-        for x in info.get("symbols", []):
-            if x.get("status") == "TRADING" and x.get("quoteAsset") == QUOTE:
-                syms.append(x["symbol"])
-        syms = sorted(set(syms))
+        async with aiohttp.ClientSession(headers=_HTTP_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as s:
+            # 1) Основной: /api/v3/exchangeInfo
+            try:
+                info = await _fetch_json(s, f"{MEXC_API}/exchangeInfo")
+                raw = info.get("symbols") or []
+                if raw:
+                    symbols = [
+                        x["symbol"] for x in raw
+                        if x.get("status") == "TRADING" and x.get("quoteAsset") == QUOTE
+                    ]
+            except Exception as e:
+                log.warning("exchangeInfo failed: %s", e)
 
-        if syms:
-            _symbols_cache = syms
-            _last_reload = now
-            log.info("Pairs updated: %d (QUOTE=%s)", len(_symbols_cache), QUOTE)
-            return _symbols_cache, True
-        else:
-            # пустышка — кэш НЕ трогаем, следующий опрос не раньше чем через 5 минут
-            log.warning("MEXC returned 0 symbols; keep cache=%d. Backoff 5m.", len(_symbols_cache))
-            _last_reload = now - SYMBOL_REFRESH_SEC + 300
-            return _symbols_cache, False
+            # 2) Фолбэк: /api/v3/ticker/price → фильтр по суффиксу QUOTE
+            if not symbols:
+                try:
+                    prices = await _fetch_json(s, f"{MEXC_API}/ticker/price")
+                    cand = [it["symbol"] for it in prices if isinstance(it, dict) and it.get("symbol", "").endswith(QUOTE)]
+                    # фильтр левередж-токенов по суффиксам
+                    bad_suffixes = ("3L", "3S", "4L", "4S", "5L", "5S", "UP", "DOWN")
+                    def ok(sym: str) -> bool:
+                        base = sym[: -len(QUOTE)] if sym.endswith(QUOTE) else sym
+                        return not any(base.endswith(suf) for suf in bad_suffixes)
+                    symbols = [sym for sym in cand if ok(sym)]
+                except Exception as e:
+                    log.warning("ticker/price fallback failed: %s", e)
 
+            # 3) Фолбэк: /open/api/v2/market/symbols (возвращает BTC_USDT → конвертируем в BTCUSDT)
+            if not symbols:
+                try:
+                    j = await _fetch_json(s, f"{OPEN_API}/market/symbols")
+                    data = j.get("data") or []
+                    conv = []
+                    for it in data:
+                        state = (it.get("state") or "").upper()
+                        if state in ("ENABLED", "ENALBED", "ONLINE"):  # видели опечатки в ответах
+                            sym = it.get("symbol", "")
+                            if "_" in sym:
+                                base, quote = sym.split("_", 1)
+                                if quote == QUOTE:
+                                    conv.append(f"{base}{quote}")
+                    symbols = conv
+                except Exception as e:
+                    log.warning("open/api/v2 fallback failed: %s", e)
     except Exception as e:
-        # сетевая/HTTP ошибка — кэш сохраняем, бэк-офф 5 минут
-        log.exception("Pairs refresh failed: %s", e)
-        _last_reload = now - SYMBOL_REFRESH_SEC + 300
+        log.warning("pairs session failed: %s", e)
+
+    symbols = sorted(set(symbols))
+
+    if symbols:
+        _symbols_cache = symbols
+        _last_reload = now
+        _next_pairs_fetch_at = now + SYMBOL_REFRESH_SEC
+        log.info("Pairs updated: %d (QUOTE=%s)", len(_symbols_cache), QUOTE)
+        return _symbols_cache, True
+    else:
+        # пусто — кэш не трогаем, ждём 5 минут
+        _next_pairs_fetch_at = now + 300
+        log.warning("MEXC returned 0 symbols (all fallbacks). Keep cache=%d. Backoff 5m.", len(_symbols_cache))
         return _symbols_cache, False
 
 # ---------- Свечи 1m с MEXC ----------
@@ -86,7 +134,7 @@ def calc_rsi(closes: list[float], period: int = 14) -> float | None:
     if len(closes) < period + 1:
         return None
 
-    # Wilder's RSI: начальные средние по первым 'period' изменениям
+    # Wilder's RSI
     gains = losses = 0.0
     for i in range(1, period + 1):
         d = closes[i] - closes[i - 1]
@@ -97,7 +145,6 @@ def calc_rsi(closes: list[float], period: int = 14) -> float | None:
     avg_gain = gains / period
     avg_loss = losses / period
 
-    # сглаживание
     for i in range(period + 1, len(closes)):
         d = closes[i] - closes[i - 1]
         gain = d if d > 0 else 0.0
@@ -134,25 +181,24 @@ async def scanner_loop(bot, chat_id: int):
         try:
             symbols, refreshed = await fetch_symbols()
 
-            # уведомление об обновлении пар — только при реальном изменении и не чаще, чем раз в 10 минут
-            now = time.time()
-            if refreshed:
-                if last_pairs_count != len(symbols) and (now - last_pairs_announce_ts) > 600:
-                    try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
-                        )
-                        last_pairs_count = len(symbols)
-                        last_pairs_announce_ts = now
-                    except Exception:
-                        log.exception("Pairs announce failed")
+            # уведомление об обновлении пар — только при реальном изменении и не чаще 1 раза в 10 минут
+            now_ts = time.time()
+            if refreshed and (last_pairs_count != len(symbols)) and (now_ts - last_pairs_announce_ts) > 600:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
+                    )
+                    last_pairs_count = len(symbols)
+                    last_pairs_announce_ts = now_ts
+                except Exception:
+                    log.exception("Pairs announce failed")
 
             if not symbols:
                 await asyncio.sleep(5)
                 continue
 
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
+            async with aiohttp.ClientSession(headers=_HTTP_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as s:
 
                 async def handle(sym: str):
                     async with sem:
@@ -183,7 +229,6 @@ async def scanner_loop(bot, chat_id: int):
 
                                 pct = round(change * 100, 2)
                                 mexc_url = f"https://www.mexc.com/exchange/{sym.replace(QUOTE,'')}_{QUOTE}"
-                                # У TV не все тикеры MEXC есть — оставляем общий чарт с символом
                                 tv_url   = f"https://www.tradingview.com/chart/?symbol=MEXC:{sym}"
 
                                 text = (
@@ -218,7 +263,6 @@ async def scanner_loop(bot, chat_id: int):
                 await asyncio.gather(*tasks)
 
         except Exception:
-            # не уронить цикл целиком
             log.exception("scanner_loop tick failed")
 
         await asyncio.sleep(SCAN_INTERVAL)
