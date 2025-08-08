@@ -3,9 +3,11 @@ services:
     name: telegram-bot-webhook
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: "pip install -U pip wheel setuptools && pip install -r requirements.txt"
     startCommand: "python main.py"
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: TOKEN
         sync: false
       - key: CHAT_ID
@@ -21,73 +23,28 @@ services:
     name: telegram-bot-scanner
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: "pip install -U pip wheel setuptools && pip install -r requirements.txt"
     startCommand: "python worker.py"
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: TOKEN
         sync: false
       - key: CHAT_ID
         sync: false
-      # ниже — опциональные настройки стратегии/фильтров/универса:
-      - key: FUTURES_SEED
-        sync: false
-      - key: ALIASES
-        value: "MATICUSDT=POLUSDT;FTMUSDT=REMOVE"
-      - key: PUMP_THRESHOLD
-        value: "0.07"
-      - key: RSI_MIN
-        value: "70"
-      - key: SCAN_INTERVAL
-        value: "60"
-      - key: SYMBOL_REFRESH_SEC
-        value: "86400"
-      - key: QUOTE_FILTER
-        value: "USDT"
-      - key: MAX_CONCURRENCY
-        value: "8"
-      - key: COOLDOWN_SEC
-        value: "900"
-      - key: DEPOSIT_USDT
-        value: "100"
-      - key: RISK_PER_TRADE_BPS
-        value: "10"
-      - key: MARGIN_CAP_BPS
-        value: "100"
-      - key: MIN_NOTIONAL_USDT
-        value: "5"
-      - key: MIN_COIN_AGE_DAYS
-        value: "30"
-      - key: REQUIRE_MONTHLY_DOWNTREND
+      # — базовые настройки для теста сигналов —
+      - key: UNIVERSE_REFRESH_MODE
+        value: seed
+      - key: SIGNAL_SOURCE
+        value: spot
+      - key: REQUIRE_SPOT_USDT
         value: "true"
-      - key: ABNORMAL_DAILY_PUMP_BPS
-        value: "5000"
-      - key: BTC_FILTER
-        value: "on"
-      - key: FUNDING_MAX_BPS
-        value: "30"
+      - key: PUMP_THRESHOLD
+        value: "0.025"   # 2.5% на 1м — чтобы были сигналы
+      - key: RSI_MIN
+        value: "60"
+      - key: COOLDOWN_SEC
+        value: "120"
       - key: ENTRY_MODE
-        value: "retest_sr"
-      - key: ENTRY_OFFSET_BPS
-        value: "5"
-      - key: STOP_MODE
-        value: "swing_high"
-      - key: STOP_BUFFER_BPS
-        value: "10"
-      - key: TAKE_PROFIT_R
-        value: "2.5"
-      - key: ATR_PERIOD
-        value: "14"
-      - key: ATR_MULT
-        value: "1.5"
-      - key: DCA1_BPS
-        value: "1000"
-      - key: DCA2_BPS
-        value: "1500"
-      - key: REQUIRE_VIP_STATS
-        value: "false"
-      - key: STATS_FILE
-        value: "stats.json"
-      - key: SYMBOLS_CACHE_FILE
-        value: "futures_usdt_cache.json"
-        buildCommand: "pip install -U pip wheel setuptools && pip install -r requirements.txt"
-
+        value: break1m
+      # при желании: добавь свой FUTURES_SEED в Dashboard или сюда
