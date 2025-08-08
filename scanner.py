@@ -48,7 +48,6 @@ STATS_FILE         = os.getenv("STATS_FILE","stats.json")
 
 # ---------- API ----------
 SPOT_API      = "https://api.mexc.com/api/v3"
-OPEN_API      = "https://www.mexc.com/open/api/v2"
 CONTRACT_API  = "https://contract.mexc.com/api/v1/contract"
 QUOTE         = "USDT"  # для ссылок/маппинга
 
@@ -59,12 +58,12 @@ HEADERS       = {"User-Agent":"TradeSignalFilterBot/2.0 (+render)", "Accept":"ap
 _last_sent: dict[str, float] = {}
 _last_sent_lock = asyncio.Lock()
 
-# список фьючерсных символов (в формате SPOT: BTCUSDT). Кэш на сутки.
+# список фьючерсных символов (в формате SPOT: BTCUSDT). Кэш.
 _fut_syms: List[str] = []
 _last_refresh = 0.0
 _next_fetch_at = 0.0
 
-# Учёт «открытых» сигналов (для лимитов): очень простой в памяти
+# Учёт «открытых» сигналов (для лимитов)
 _open: List[dict] = []  # {sym, ts, notional}
 
 def _prune_open(now: float, ttl: int = 6*3600):
@@ -98,96 +97,53 @@ def mexc_futures_url(sym: str) -> str:
 def tv_url(sym: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol=MEXC:{sym}"
 
-# ---------- УНИВЕРС: ТОЛЬКО ФЬЮЧЕРСЫ ----------
-async def _spot_usdt_candidates(session: aiohttp.ClientSession) -> List[str]:
-    """Собираем кандидатов со спота (как список тикеров вида BTCUSDT)."""
-    # 1) exchangeInfo
-    try:
-        info = await _get_json(session, f"{SPOT_API}/exchangeInfo")
-        raw = info.get("symbols") or []
-        out = [x["symbol"] for x in raw if x.get("status")=="TRADING" and x.get("quoteAsset")==QUOTE]
-        if out: return sorted(set(out))
-    except Exception:
-        pass
-    # 2) /ticker/price
-    try:
-        prices = await _get_json(session, f"{SPOT_API}/ticker/price")
-        out = [it["symbol"] for it in prices if isinstance(it,dict) and str(it.get("symbol","")).endswith(QUOTE)]
-        return sorted(set(out))
-    except Exception:
-        pass
-    # 3) open/api/v2 (BTC_USDT → BTCUSDT)
-    try:
-        j = await _get_json(session, f"{OPEN_API}/market/symbols")
-        data = j.get("data") or []
-        res = []
-        for it in data:
-            st = (it.get("state") or "").upper()
-            if st in ("ENABLED","ENALBED","ONLINE"):
-                s = it.get("symbol","")
-                if "_" in s:
-                    b,q = s.split("_",1)
-                    if q==QUOTE: res.append(f"{b}{q}")
-        return sorted(set(res))
-    except Exception:
-        return []
-
-async def _contract_exists(session: aiohttp.ClientSession, sym: str) -> bool:
-    """Проверяем, что у SPOT-символа есть USDT-перп контракт."""
-    c = spot_to_contract(sym)
-    endpoints = [
-        ("detail", {"symbol": c}),
-        ("ticker", {"symbol": c}),
-        ("indexPrice", {"symbol": c}),
-    ]
-    for ep, params in endpoints:
-        try:
-            j = await _get_json(session, f"{CONTRACT_API}/{ep}", **params)
-            if isinstance(j, dict) and j.get("data") not in (None, []):
-                return True
-        except Exception:
-            continue
-    return False
-
+# ---------- СТАБИЛЬНЫЙ УНИВЕРС ПЕРПЕТУАЛОВ ----------
 async def fetch_futures_symbols() -> tuple[List[str], bool]:
-    """Возвращает список спотовых тикеров, у которых есть USDT-perp контракт."""
+    """
+    Возвращает список SPOT-тикеров (BTCUSDT и т.п.), у которых есть USDT-perp.
+    Берём напрямую из /api/v1/contract/detail без параметра symbol.
+    """
     global _fut_syms, _last_refresh, _next_fetch_at
     now = time.time()
-    if now < _next_fetch_at:
-        return _fut_syms, False
+
+    # кэширование
     if _fut_syms and (now - _last_refresh) < SYMBOL_REFRESH_SEC:
         return _fut_syms, False
 
     try:
         async with aiohttp.ClientSession() as s:
-            spot = await _spot_usdt_candidates(s)
-            if not spot:
-                _next_fetch_at = now + 300
-                log.warning("No spot candidates; futures universe not refreshed (backoff 5m).")
-                return _fut_syms, False
-
-            sem = asyncio.Semaphore(20)
+            j = await _get_json(s, f"{CONTRACT_API}/detail")
+            data = j.get("data") or []
             fut: List[str] = []
-            async def check(sym: str):
-                async with sem:
-                    if await _contract_exists(s, sym):
-                        fut.append(sym)
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                # только активные USDT-M и доступные по API
+                if str(it.get("state")) != "0":
+                    continue
+                if (it.get("quoteCoin") != "USDT") or (it.get("settleCoin") != "USDT"):
+                    continue
+                if it.get("apiAllowed") is False:
+                    continue
+                base = str(it.get("baseCoin", "")).upper()
+                if not base:
+                    continue
+                fut.append(f"{base}USDT")
 
-            await asyncio.gather(*(check(sym) for sym in spot))
             fut = sorted(set(fut))
             if fut:
                 _fut_syms = fut
                 _last_refresh = now
                 _next_fetch_at = now + SYMBOL_REFRESH_SEC
-                log.info("Futures universe updated: %d symbols (USDT perps).", len(_fut_syms))
+                log.info("Futures universe updated (via /contract/detail): %d USDT perps", len(_fut_syms))
                 return _fut_syms, True
             else:
                 _next_fetch_at = now + 300
-                log.warning("Contract check returned 0 symbols (backoff 5m).")
+                log.warning("contract/detail returned 0 USDT perps; backoff 5m.")
                 return _fut_syms, False
     except Exception as e:
         _next_fetch_at = now + 300
-        log.warning("fetch_futures_symbols failed: %s (backoff 5m).", e)
+        log.warning("fetch_futures_symbols via /detail failed: %s (backoff 5m).", e)
         return _fut_syms, False
 
 # ---------- ДАННЫЕ / ИНДИКАТОРЫ ----------
@@ -297,8 +253,7 @@ async def daily_pump_risk(session: aiohttp.ClientSession, sym: str) -> bool:
     return any(abs((c[i]-c[i-1])/max(1e-12,c[i-1])) >= thr for i in range(1,len(c)))
 
 async def btc_ok(session: aiohttp.ClientSession) -> bool:
-    """BTC в коррекции/флэте: 15m изменение ≤0.5% ИЛИ 60m наклон ≤0.
-    На MEXC часовой интервал — '60m'."""
+    """BTC в коррекции/флэте: 15m изменение ≤0.5% ИЛИ 60m наклон ≤0. На MEXC часовой интервал — '60m'."""
     if not BTC_FILTER:
         return True
     try:
