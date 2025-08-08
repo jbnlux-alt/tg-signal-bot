@@ -89,3 +89,5 @@ services:
         value: "stats.json"
       - key: SYMBOLS_CACHE_FILE
         value: "futures_usdt_cache.json"
+        buildCommand: "pip install -U pip wheel setuptools && pip install -r requirements.txt"
+
