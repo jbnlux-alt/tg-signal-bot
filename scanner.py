@@ -1,730 +1,321 @@
-# scanner.py — Signals on SPOT(USDT), trade on FUTURES (USDT-perps)
-# - устойчивый универс перпов (кэш/семена/фоллбэки/бэкофф)
-# - свечи для сигналов: SPOT по умолчанию (SIGNAL_SOURCE=spot)
-# - график с S/R + swing-high метками + ENTRY/STOP/TAKE (требует charts.py)
-# - алиасы/делисты (MATIC→POL и т.п.), карантин «битых» символов без клинок
-# - graceful cancel в основном цикле
+# scanner.py
+import os
+import time
+import math
+import asyncio
+import logging
+import aiohttp
+from typing import List, Tuple, Optional
 
-import os, asyncio, aiohttp, time, logging, json, random
-from typing import List, Optional
 from telegram.constants import ParseMode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, TimedOut, RetryAfter, BadRequest
 
-from charts import render_chart_image, klines_to_df, compute_sr_levels
-
-# ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("scanner")
 
-# ---------- ENV / ПРАВИЛА ----------
-PUMP_THRESHOLD     = float(os.getenv("PUMP_THRESHOLD", "0.07"))   # 7% за 1м
-RSI_MIN            = float(os.getenv("RSI_MIN", "70"))
-SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "60"))
-SYMBOL_REFRESH_SEC = int(os.getenv("SYMBOL_REFRESH_SEC", "86400")) # раз в сутки
+# ===================== ENV =====================
+PUMP_THRESHOLD     = float(os.getenv("PUMP_THRESHOLD", "0.07"))      # 7% за 1м
+RSI_MIN            = float(os.getenv("RSI_MIN", "70"))               # порог RSI
+SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "60"))           # сек между итерациями
+SYMBOL_REFRESH_SEC = int(os.getenv("SYMBOL_REFRESH_SEC", "86400"))   # раз в сутки обновляем список
+QUOTE              = os.getenv("QUOTE_FILTER", "USDT")               # котировка
 MAX_CONCURRENCY    = int(os.getenv("MAX_CONCURRENCY", "8"))
-COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", "900"))
+COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", "900"))           # антиспам по символу
+STARTUP_PING       = os.getenv("STARTUP_PING", "true").lower() == "true"
 
-# Источник свечей для сигналов
-SIGNAL_SOURCE      = os.getenv("SIGNAL_SOURCE", "spot").lower()   # spot|futures|auto
-REQUIRE_SPOT_USDT  = os.getenv("REQUIRE_SPOT_USDT","true").lower()=="true"
+MIN_COIN_AGE_DAYS  = int(os.getenv("MIN_COIN_AGE_DAYS", "30"))       # не младше
+BTC_FILTER         = os.getenv("BTC_FILTER", "off").lower()          # 'on'/'off'
 
-# Управление обновлением универса
-UNIVERSE_REFRESH_MODE = os.getenv("UNIVERSE_REFRESH_MODE", "auto").lower()  # auto|seed|off
+DISABLE_CHARTS     = os.getenv("DISABLE_CHARTS", "false").lower() == "true"
 
-# Риск-менеджмент
-DEPOSIT_USDT       = float(os.getenv("DEPOSIT_USDT", "100"))       # дефолт 100
-RISK_PER_TRADE_BPS = float(os.getenv("RISK_PER_TRADE_BPS", "10"))  # 0.1%
-MARGIN_CAP_BPS     = float(os.getenv("MARGIN_CAP_BPS", "100"))     # ≤1% суммарно
-MIN_NOTIONAL_USDT  = float(os.getenv("MIN_NOTIONAL_USDT", "5"))
+MEXC_SPOT_API      = "https://api.mexc.com/api/v3"
 
-# Фильтры
-MIN_COIN_AGE_DAYS  = int(os.getenv("MIN_COIN_AGE_DAYS", "30"))
-REQUIRE_MONTHLY_DOWNTREND = os.getenv("REQUIRE_MONTHLY_DOWNTREND","true").lower()=="true"
-ABNORMAL_DAILY_PUMP_BPS   = float(os.getenv("ABNORMAL_DAILY_PUMP_BPS","5000"))
-BTC_FILTER         = os.getenv("BTC_FILTER","on").lower()=="on"
-FUNDING_MAX_BPS    = float(os.getenv("FUNDING_MAX_BPS","30"))      # 0.30%
+# таймауты HTTP
+HTTP_TOTAL_TIMEOUT = int(os.getenv("HTTP_TOTAL_TIMEOUT", "15"))
 
-# Вход / стоп / тейк
-ENTRY_MODE         = os.getenv("ENTRY_MODE","retest_sr")           # break1m | retest_sr
-ENTRY_OFFSET_BPS   = float(os.getenv("ENTRY_OFFSET_BPS","5"))
-STOP_MODE          = os.getenv("STOP_MODE","swing_high")           # swing_high | atr
-STOP_BUFFER_BPS    = float(os.getenv("STOP_BUFFER_BPS","10"))
-TAKE_PROFIT_R      = float(os.getenv("TAKE_PROFIT_R","2.5"))
-ATR_PERIOD         = int(os.getenv("ATR_PERIOD","14"))
-ATR_MULT           = float(os.getenv("ATR_MULT","1.5"))
-DCA1_BPS           = float(os.getenv("DCA1_BPS","1000"))           # -10%
-DCA2_BPS           = float(os.getenv("DCA2_BPS","1500"))           # -15%
+# ретраи телеги
+TG_MAX_ATTEMPTS    = int(os.getenv("TG_MAX_ATTEMPTS", "5"))
+TG_BACKOFF_BASE    = float(os.getenv("TG_BACKOFF_BASE", "1.5"))
 
-# VIP/статистика
-REQUIRE_VIP_STATS  = os.getenv("REQUIRE_VIP_STATS","false").lower()=="true"
-STATS_FILE         = os.getenv("STATS_FILE","stats.json")
+# ===================== Charts (optional) =====================
+HAVE_CHARTS = False
+try:
+    if not DISABLE_CHARTS:
+        # charts.py должен лежать рядом с проектом
+        from charts import render_chart_image, klines_to_df, compute_sr_levels
+        HAVE_CHARTS = True
+except Exception as e:
+    log.warning("charts disabled: %s", e)
+    HAVE_CHARTS = False
 
-# Семена и файл кэша универса
-FUTURES_SEED       = [s.strip().upper() for s in os.getenv("FUTURES_SEED","").split(",") if s.strip()]
-SYMBOLS_CACHE_FILE = os.getenv("SYMBOLS_CACHE_FILE","futures_usdt_cache.json")
+# ===================== In-memory state =====================
+_symbols_cache: List[str] = []
+_last_reload: float = 0.0
 
-# Алиасы/делисты (можно расширять в ENV: ALIASES="MATICUSDT=POLUSDT;XYZUSDT=REMOVE")
-ALIASES_RAW = os.getenv("ALIASES", "MATICUSDT=POLUSDT;FTMUSDT=REMOVE")
-
-# ---------- API ----------
-SPOT_API      = "https://api.mexc.com/api/v3"
-CONTRACT_API  = "https://contract.mexc.com/api/v1/contract"
-QUOTE         = "USDT"  # для ссылок/маппинга
-
-HTTP_TIMEOUT  = aiohttp.ClientTimeout(total=15)
-HEADERS       = {
-    "User-Agent": "Mozilla/5.0 (compatible; TradeSignalFilterBot/2.3; +render)",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://www.mexc.com",
-    "Referer": "https://www.mexc.com",
-}
-
-# ---------- КЭШ / СОСТОЯНИЕ ----------
-_last_sent: dict[str, float] = {}
+_last_sent: dict[str, float] = {}            # антиспам по символу
 _last_sent_lock = asyncio.Lock()
 
-# список фьючерсных символов (в формате SPOT: BTCUSDT). Кэш.
-_fut_syms: List[str] = []
-_last_refresh = 0.0
-_next_fetch_at = 0.0  # чтобы не долбить API после неудачи (бэкофф)
+_sent_startup_ping = False
 
-# Учёт «открытых» сигналов (для лимитов)
-_open: List[dict] = []  # {sym, ts, notional}
-
-# Авто-карантин символов без данных
-FAIL_LIMIT = 3
-BAD_SYMBOL_TTL_SEC = 24 * 3600
-_fail_cnt: dict[str, int] = {}
-_bad_until: dict[str, float] = {}
-
-# ---------- АЛИАСЫ / ДЕЛИСТЫ ----------
-def _parse_aliases(raw: str) -> dict:
-    m = {}
-    for part in raw.split(";"):
-        part = part.strip()
-        if not part:
-            continue
-        if "=" in part:
-            a, b = part.split("=", 1)
-            m[a.strip().upper()] = b.strip().upper()
-        else:
-            m[part.upper()] = part.upper()
-    return m
-
-ALIASES = _parse_aliases(ALIASES_RAW)
-
-def _canon(sym: str) -> Optional[str]:
-    s = sym.strip().upper()
-    # поддержка формы в семенах: XXXUSDT:REMOVE
-    if s.endswith(":REMOVE"):
-        return None
-    mapped = ALIASES.get(s, s)
-    if mapped in ("REMOVE", "DELISTED", "-", "NONE", ""):
-        return None
-    return mapped
-
-# ---------- УТИЛЫ ----------
-async def _get_json(session: aiohttp.ClientSession, url: str, **params):
-    async with session.get(url, params=params, headers=HEADERS, timeout=HTTP_TIMEOUT, allow_redirects=True) as r:
-        r.raise_for_status()
-        return await r.json(content_type=None)
-
-def spot_to_contract(sym: str) -> str:
-    # BTCUSDT → BTC_USDT
-    return f"{sym.replace(QUOTE,'')}_{QUOTE}"
-
-def mexc_futures_url(sym: str) -> str:
-    base = sym.replace(QUOTE,'')
-    return f"https://www.mexc.com/exchange/{base}_{QUOTE}?type=perpetual"
-
-def tv_url(sym: str) -> str:
-    return f"https://www.tradingview.com/chart/?symbol=MEXC:{sym}"
-
-def _load_cached_syms() -> List[str]:
-    try:
-        with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return [str(x).upper() for x in data if isinstance(x, str)]
-    except Exception:
-        return []
-
-def _save_cached_syms(syms: List[str]) -> None:
-    try:
-        with open(SYMBOLS_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(set(syms)), f, ensure_ascii=False)
-    except Exception:
-        pass
-
-def _prune_open(now: float, ttl: int = 6*3600):
-    global _open
-    _open = [x for x in _open if now - x["ts"] < ttl]
-
-def _open_count_total() -> int:
-    return len(_open)
-
-def _open_count_symbol(sym: str) -> int:
-    return sum(1 for x in _open if x["sym"] == sym)
-
-def _open_margin_bps() -> float:
-    total_notional = sum(x["notional"] for x in _open)
-    return 10000.0 * total_notional / max(1e-9, DEPOSIT_USDT)
-
-# ---------- ROBUST KLINES (SPOT/FUTURES/ANY) ----------
-_INTERV_SPOT = {
-    "1m":  ["1m"],
-    "5m":  ["5m"],
-    "60m": ["60m"],
-    "4h":  ["4h"],
-    "1d":  ["1d"],
-}
-_CONTRACT_IV = {"1m":"Min1", "5m":"Min5", "60m":"Min60", "4h":"Hour4", "1d":"Day1"}
-_CONTRACT_IV_SEC = {"Min1":60, "Min5":300, "Min60":3600, "Hour4":14400, "Day1":86400}
-
-async def _klines_spot(session, sym: str, base_interval: str, limit: int):
-    for iv in _INTERV_SPOT.get(base_interval, [base_interval]):
-        try:
-            return await _get_json(session, f"{SPOT_API}/klines", symbol=sym, interval=iv, limit=str(limit))
-        except Exception:
-            continue
-    return []
-
-async def _klines_contract(session, sym: str, base_interval: str, limit: int):
-    ci = _CONTRACT_IV.get(base_interval)
-    if not ci:
-        return []
-    try:
-        c = spot_to_contract(sym)  # BTCUSDT -> BTC_USDT
-        j = await _get_json(session, f"{CONTRACT_API}/kline/{c}", interval=ci)
-        d = j.get("data") or {}
-        t, o, h, l, c_, v = (d.get("time") or []), (d.get("open") or []), (d.get("high") or []), (d.get("low") or []), (d.get("close") or []), (d.get("vol") or [])
-        sec = _CONTRACT_IV_SEC[ci]
-        rows = []
-        for i in range(min(len(t), len(o), len(h), len(l), len(c_), len(v))):
-            ot = int(t[i]) * 1000
-            ct = ot + sec * 1000
-            rows.append([ot, str(o[i]), str(h[i]), str(l[i]), str(c_[i]), str(v[i]), ct, "0", "0", 0, "0"])
-        return rows[-limit:] if limit else rows
-    except Exception:
-        return []
-
-async def _klines_any(session, sym: str, base_interval: str, limit: int):
-    now = time.time()
-    if _bad_until.get(sym, 0.0) > now:
-        return []
-    data = await _klines_spot(session, sym, base_interval, limit)
-    if data:
-        _fail_cnt[sym] = 0
-        return data
-    data = await _klines_contract(session, sym, base_interval, limit)
-    if data:
-        _fail_cnt[sym] = 0
-        return data
-    _fail_cnt[sym] = _fail_cnt.get(sym, 0) + 1
-    if _fail_cnt[sym] >= FAIL_LIMIT:
-        _bad_until[sym] = now + BAD_SYMBOL_TTL_SEC
-        log.warning("No klines from spot/contract for %s %s (limit=%s). Quarantine 24h.", sym, base_interval, limit)
-    else:
-        log.warning("No klines from spot/contract for %s %s (limit=%s)", sym, base_interval, limit)
-    return []
-
-# Свечи для сигналов (RSI/памп/SR)
-async def _klines_signal(session, sym: str, base_interval: str, limit: int):
-    if SIGNAL_SOURCE == "spot":
-        d = await _klines_spot(session, sym, base_interval, limit)
-        if d: return d
-        return await _klines_contract(session, sym, base_interval, limit)
-    elif SIGNAL_SOURCE == "futures":
-        d = await _klines_contract(session, sym, base_interval, limit)
-        if d: return d
-        return await _klines_spot(session, sym, base_interval, limit)
-    else:  # auto
-        return await _klines_any(session, sym, base_interval, limit)
-
-async def _has_spot_usdt(session, sym: str) -> bool:
-    try:
-        info = await _get_json(session, f"{SPOT_API}/exchangeInfo")
-        for x in info.get("symbols") or []:
-            if x.get("symbol")==sym and x.get("status")=="TRADING" and x.get("quoteAsset")=="USDT":
-                return True
-    except Exception:
-        pass
-    return False
-
-# ---------- СТАБИЛЬНЫЙ УНИВЕРС ПЕРПЕТУАЛОВ ----------
-async def fetch_futures_symbols() -> tuple[List[str], bool]:
+# ===================== Telegram helpers =====================
+async def tg_call(bot, method: str, *args, **kwargs):
     """
-    Возвращает список SPOT-тикеров (BTCUSDT и т.п.), у которых есть USDT-perp.
-    Стратегия:
-      1) /contract/detail (без symbol) — основной источник
-      2) если пусто/403 — фоллбэк: кандидаты со спота + проверка наличия контракта
-      3) если опять пусто — берём кэш с диска и/или семена из ENV
-    Кэш не затираем при неуспехе. Обновляем раз в SYMBOL_REFRESH_SEC. Бэкофф 5м при неудаче.
+    Надёжный вызов Telegram API с ретраями и экспоненциальным бэкоффом.
+    Возвращает результат или None.
     """
-    global _fut_syms, _last_refresh, _next_fetch_at
-    now = time.time()
-
-    # seed/off режим — работаем только по кэшу/семенам
-    if UNIVERSE_REFRESH_MODE in ("seed", "off"):
-        if not _fut_syms:
-            disk = _load_cached_syms()
-            if disk:
-                _fut_syms = [x for x in (_canon(y) for y in disk) if x]
-            elif FUTURES_SEED:
-                _fut_syms = [x for x in (_canon(y) for y in FUTURES_SEED) if x]
-        return _fut_syms, False
-
-    # Бэкофф после неудач
-    if now < _next_fetch_at:
-        return _fut_syms, False
-
-    # уважение кэш-TTL
-    if _fut_syms and (now - _last_refresh) < SYMBOL_REFRESH_SEC:
-        return _fut_syms, False
-
-    # базовая «подстраховка»
-    if not _fut_syms:
-        disk = _load_cached_syms()
-        if disk:
-            _fut_syms = [x for x in (_canon(y) for y in disk) if x]
-        elif FUTURES_SEED:
-            _fut_syms = [x for x in (_canon(y) for y in FUTURES_SEED) if x]
-
-    new_list: List[str] = []
-
-    # 1) основной источник — contract/detail
-    try:
-        async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as s:
-            j = await _get_json(s, f"{CONTRACT_API}/detail")
-            data = j.get("data") or []
-            for it in data:
-                if not isinstance(it, dict): continue
-                if str(it.get("state")) != "0": continue
-                if (it.get("quoteCoin") != "USDT") or (it.get("settleCoin") != "USDT"): continue
-                if it.get("apiAllowed") is False: continue
-                base = str(it.get("baseCoin", "")).upper()
-                if base: new_list.append(f"{base}USDT")
-    except Exception as e:
-        log.warning("contract/detail primary failed: %s", e)
-
-    # 2) фоллбэк — спот кандидаты + проверка контракта
-    if not new_list:
+    for attempt in range(1, TG_MAX_ATTEMPTS + 1):
         try:
-            async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as s:
-                info = await _get_json(s, f"{SPOT_API}/exchangeInfo")
-                raw = info.get("symbols") or []
-                cand = [x["symbol"] for x in raw if x.get("status")=="TRADING" and x.get("quoteAsset")=="USDT"]
-                bad = ("3L","3S","4L","4S","5L","5S","UP","DOWN")
-                def ok(sym: str) -> bool:
-                    base = sym[:-4] if sym.endswith("USDT") else sym
-                    return not any(base.endswith(suf) for suf in bad)
-                cand = [c for c in cand if ok(c)]
+            return await getattr(bot, method)(*args, **kwargs)
 
-                sem = asyncio.Semaphore(12)
-                tmp: List[str] = []
-                async def check(sym: str):
-                    async with sem:
-                        c = spot_to_contract(sym)
-                        eps = [("detail", {"symbol": c}), ("ticker", {"symbol": c}), ("indexPrice", {"symbol": c})]
-                        for ep, params in eps:
-                            try:
-                                j2 = await _get_json(s, f"{CONTRACT_API}/{ep}", **params)
-                                if isinstance(j2, dict) and j2.get("data") not in (None, []):
-                                    tmp.append(sym); return
-                            except Exception:
-                                continue
-                await asyncio.gather(*(check(x) for x in cand))
-                new_list = sorted(set(tmp))
+        except RetryAfter as e:
+            delay = float(getattr(e, "retry_after", 1.0)) + 0.5
+            await asyncio.sleep(delay)
+
+        except (NetworkError, TimedOut) as e:
+            if attempt == TG_MAX_ATTEMPTS:
+                log.warning("TG %s failed after %d tries: %s", method, attempt, e)
+                return None
+            await asyncio.sleep(TG_BACKOFF_BASE ** attempt)
+
+        except BadRequest as e:
+            log.warning("TG BadRequest in %s: %s", method, e)
+            return None
+
         except Exception as e:
-            log.warning("fallback spot->contract failed: %s", e)
+            log.warning("TG error in %s: %r", method, e)
+            return None
 
-    # применяем алиасы/делисты к new_list
-    new_list = [x for x in (_canon(y) for y in new_list) if x]
+async def tg_send_message(bot, **kwargs):
+    return await tg_call(bot, "send_message", **kwargs)
 
-    # (опционально) оставить только те, у кого есть SPOT USDT (для стабильных сигналов)
-    if REQUIRE_SPOT_USDT and new_list:
-        try:
-            async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as s:
-                sem = asyncio.Semaphore(16)
-                keep: List[str] = []
-                async def chk(sym):
-                    async with sem:
-                        if await _has_spot_usdt(s, sym):
-                            keep.append(sym)
-                await asyncio.gather(*(chk(x) for x in new_list))
-                new_list = sorted(set(keep))
-        except Exception:
-            pass
+async def tg_send_photo(bot, **kwargs):
+    return await tg_call(bot, "send_photo", **kwargs)
 
-    # 3) если снова пусто — не обнуляем, держим кэш/семена, ставим бэкофф
-    if not new_list:
-        if _fut_syms:
-            _next_fetch_at = now + 300 + random.randint(0,60)
-            log.warning("No futures from APIs; keep cache=%d. Backoff 5m.", len(_fut_syms))
-            return _fut_syms, False
-        disk = _load_cached_syms()
-        if disk:
-            _fut_syms = [x for x in (_canon(y) for y in disk) if x]
-            _next_fetch_at = now + 300 + random.randint(0,60)
-            log.warning("APIs empty; loaded %d symbols from disk cache. Backoff 5m.", len(_fut_syms))
-            return _fut_syms, False
-        if FUTURES_SEED:
-            _fut_syms = [x for x in (_canon(y) for y in FUTURES_SEED) if x]
-            _next_fetch_at = now + 300 + random.randint(0,60)
-            log.warning("APIs empty; using FUTURES_SEED=%d symbols. Backoff 5m.", len(_fut_syms))
-            return _fut_syms, False
-        _next_fetch_at = now + 300 + random.randint(0,60)
-        log.warning("APIs empty; no cache or seeds. Backoff 5m.")
-        return _fut_syms, False
+# ===================== HTTP helpers =====================
+async def _fetch_json(session: aiohttp.ClientSession, url: str, **params):
+    timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT)
+    async with session.get(url, params=params, timeout=timeout) as r:
+        r.raise_for_status()
+        return await r.json()
 
-    # успех — применяем и сохраняем
-    _fut_syms = sorted(set(new_list))
-    _last_refresh = now
-    _next_fetch_at = now + SYMBOL_REFRESH_SEC
-    _save_cached_syms(_fut_syms)
-    log.info("Futures universe refreshed: %d symbols.", len(_fut_syms))
-    return _fut_syms, True
+# ===================== Data fetchers =====================
+async def fetch_symbols() -> Tuple[List[str], bool]:
+    """
+    Возвращает (symbols, refreshed_now).
+    refreshed_now=True — если прямо сейчас обновили кэш.
+    Источник — MEXC spot /exchangeInfo (у фьючерсных перпов тикеры совпадают).
+    """
+    global _symbols_cache, _last_reload
+    now = time.time()
+    if _symbols_cache and (now - _last_reload) < SYMBOL_REFRESH_SEC:
+        return _symbols_cache, False
 
-# ---------- ДАННЫЕ / ИНДИКАТОРЫ ----------
-async def spot_klines_1m(session: aiohttp.ClientSession, sym: str, limit: int = 180):
-    return await _klines_signal(session, sym, "1m", limit)
-
-async def get_24h_contract(session: aiohttp.ClientSession, sym: str) -> tuple[Optional[float], Optional[float]]:
-    # 24h (перп): quoteVol + priceChangePercent
-    c = spot_to_contract(sym)
-    for ep in ("ticker", "detail"):
-        try:
-            j = await _get_json(session, f"{CONTRACT_API}/{ep}", symbol=c)
-            d = j.get("data") or {}
-            qv = d.get("quoteVol") or d.get("turnover") or d.get("quoteVolume")
-            pch = d.get("riseFallRate") or d.get("priceChangePercent")
-            return (float(qv) if qv is not None else None,
-                    float(pch) if pch is not None else None)
-        except Exception:
-            continue
-    return None, None
-
-async def get_funding_rate(session: aiohttp.ClientSession, sym: str) -> Optional[float]:
-    c = spot_to_contract(sym)
-    for ep in ("fundingRate", "funding/prevRate"):
-        try:
-            j = await _get_json(session, f"{CONTRACT_API}/{ep}", symbol=c)
-            d = j.get("data", j)
-            if isinstance(d, dict):
-                r = d.get("fundingRate") or d.get("rate")
-                return float(r) if r is not None else None
-            if isinstance(d, list) and d:
-                r = d[0].get("fundingRate") or d[0].get("rate")
-                return float(r) if r is not None else None
-        except Exception:
-            continue
-    return None
-
-async def get_max_leverage(session: aiohttp.ClientSession, sym: str) -> Optional[int]:
-    c = spot_to_contract(sym)
     try:
-        j = await _get_json(session, f"{CONTRACT_API}/detail", symbol=c)
-        d = j.get("data") or {}
-        lev = d.get("maxLeverage") or d.get("max_leverage")
-        return int(lev) if lev is not None else None
-    except Exception:
-        return None
+        async with aiohttp.ClientSession() as s:
+            info = await _fetch_json(s, f"{MEXC_SPOT_API}/exchangeInfo")
+        syms: List[str] = []
+        for x in info.get("symbols", []):
+            if x.get("status") == "TRADING" and x.get("quoteAsset") == QUOTE:
+                base = x.get("baseAsset", "")
+                # можно выкинуть левередж-токены, если надо:
+                # if base.endswith(("3L","3S","4L","4S","UP","DOWN")): continue
+                syms.append(x["symbol"])
+        _symbols_cache = sorted(set(syms))
+        _last_reload = now
+        return _symbols_cache, True
+    except Exception as e:
+        log.warning("fetch_symbols failed: %s", e)
+        return _symbols_cache, False
 
+async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int):
+    # формат: /klines?symbol=BTCUSDT&interval=1m&limit=30
+    return await _fetch_json(session, f"{MEXC_SPOT_API}/klines",
+                             symbol=symbol, interval=interval, limit=str(limit))
+
+# ===================== Indicators =====================
 def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1: return None
+    if len(closes) < period + 1:
+        return None
     gains = losses = 0.0
     for i in range(1, period + 1):
-        d = closes[i]-closes[i-1]
-        if d >= 0: gains += d
-        else: losses += -d
-    ag, al = gains/period, losses/period
-    for i in range(period + 1, len(closes)):
-        d = closes[i]-closes[i-1]
-        g = d if d>0 else 0.0
-        l = -d if d<0 else 0.0
-        ag = (ag*(period-1)+g)/period
-        al = (al*(period-1)+l)/period
-    if al == 0: return 100.0
-    rs = ag/al
-    return 100 - (100/(1+rs))
-
-def calc_atr(high: List[float], low: List[float], close: List[float], period: int = 14) -> Optional[float]:
-    n = len(close)
-    if n < period + 1: return None
-    trs, pc = [], close[0]
-    for i in range(1, n):
-        tr = max(high[i]-low[i], abs(high[i]-pc), abs(low[i]-pc))
-        trs.append(tr); pc = close[i]
-    atr = sum(trs[:period])/period
-    for i in range(period, len(trs)):
-        atr = (atr*(period-1)+trs[i])/period
-    return atr
-
-def _slope(vals: List[float]) -> float:
-    n = len(vals)
-    if n < 2: return 0.0
-    sx = n*(n-1)/2
-    sx2 = (n-1)*n*(2*n-1)/6
-    sy = sum(vals)
-    sxy= sum(i*v for i,v in enumerate(vals))
-    den = n*sx2 - sx*sx
-    return 0.0 if den==0 else (n*sxy - sx*sy)/den
-
-def _resample_every(vals: List[float], step: int) -> List[float]:
-    """Берём каждый step-й элемент, начиная с последнего полного блока."""
-    if len(vals) < step: return []
-    cut = (len(vals)//step)*step
-    sliced = vals[-cut:]
-    return [sliced[i] for i in range(step-1, len(sliced), step)]
-
-# ---------- ФИЛЬТРЫ СТРАТЕГИИ (используют _klines_signal) ----------
-async def coin_age_ok(session: aiohttp.ClientSession, sym: str) -> bool:
-    d1 = await _klines_signal(session, sym, "1d", MIN_COIN_AGE_DAYS + 5)
-    if isinstance(d1, list) and len(d1) >= MIN_COIN_AGE_DAYS:
-        return True
-    h4 = await _klines_signal(session, sym, "4h", (MIN_COIN_AGE_DAYS + 5)*6)
-    if isinstance(h4, list) and len(h4) >= MIN_COIN_AGE_DAYS*6:
-        return True
-    return False
-
-async def monthly_downtrend(session: aiohttp.ClientSession, sym: str) -> bool:
-    if not REQUIRE_MONTHLY_DOWNTREND: return True
-    d1 = await _klines_signal(session, sym, "1d", 40)
-    closes: List[float] = []
-    if isinstance(d1, list) and len(d1) >= 25:
-        closes = [float(x[4]) for x in d1][-30:]
-    else:
-        h4 = await _klines_signal(session, sym, "4h", 30*6 + 10)
-        if not isinstance(h4, list) or len(h4) < 30*6:
-            return False
-        c4 = [float(x[4]) for x in h4][-30*6:]
-        closes = _resample_every(c4, 6)
-        if len(closes) < 20:
-            return False
-    return _slope(closes) < 0
-
-async def daily_pump_risk(session: aiohttp.ClientSession, sym: str) -> bool:
-    d1 = await _klines_signal(session, sym, "1d", 60)
-    if not isinstance(d1, list) or len(d1) < 2:
-        return False
-    c = [float(x[4]) for x in d1]
-    thr = ABNORMAL_DAILY_PUMP_BPS/10000.0
-    return any(abs((c[i]-c[i-1])/max(1e-12,c[i-1])) >= thr for i in range(1,len(c)))
-
-async def btc_ok(session: aiohttp.ClientSession) -> bool:
-    """BTC: 15m изменение ≤0.5% ИЛИ 60m наклон ≤0."""
-    if not BTC_FILTER:
-        return True
-    try:
-        m5 = await _klines_signal(session, "BTCUSDT", "5m", 24)
-        if not isinstance(m5, list) or len(m5) < 4:
-            return True
-        c5 = [float(x[4]) for x in m5]
-        chg15 = (c5[-1] - c5[-4]) / c5[-4]
-    except Exception:
-        return True
-    slope60 = 0.0
-    try:
-        h1 = await _klines_signal(session, "BTCUSDT", "60m", 30)
-        if isinstance(h1, list) and len(h1) >= 10:
-            c60 = [float(x[4]) for x in h1][-20:]
-            slope60 = _slope(c60)
-    except Exception:
-        pass
-    return (abs(chg15) <= 0.005) or (slope60 <= 0)
-
-# ---------- Entry/Stop/Take (SHORT) ----------
-def pick_short_entry(high: List[float], low: List[float], close: List[float], levels: List[float]) -> tuple[float,float,float,str]:
-    last_c = close[-1]; prev_low = low[-2]; prev_high = high[-2]
-    off = ENTRY_OFFSET_BPS/10000.0; buf = STOP_BUFFER_BPS/10000.0
-    label = "PLAN"
-    if ENTRY_MODE == "break1m":
-        if last_c < prev_low:
-            entry = last_c; label="NOW"
+        d = closes[i] - closes[i - 1]
+        if d >= 0:
+            gains += d
         else:
-            entry = prev_low*(1-off)
-    else:
-        above = [lv for lv in levels if lv >= last_c]
-        entry = (min(above) if above else prev_high)*(1-off)
-    if STOP_MODE=="atr":
-        atr = calc_atr(high, low, close, ATR_PERIOD) or 0.0
-        stop = entry + atr*ATR_MULT
-    else:
-        stop = max(high[-1], high[-2])*(1+buf)
-    if stop <= entry: stop = entry*(1+max(buf,0.001))
-    risk = stop-entry
-    take = entry - TAKE_PROFIT_R*risk
-    return round(entry,8), round(stop,8), round(take,8), label
+            losses += -d
+    avg_gain = gains / period
+    avg_loss = losses / period
+    for i in range(period + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gain = d if d > 0 else 0.0
+        loss = -d if d < 0 else 0.0
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-def position_size(entry: float, stop: float) -> tuple[float,float,str]:
-    risk_usdt = DEPOSIT_USDT*(RISK_PER_TRADE_BPS/10000.0)
-    note = "0.1% от депозита"
-    risk = stop-entry
-    if risk <= 0: return 0.0, 0.0, "Некорректный стоп/вход"
-    qty = risk_usdt/risk
-    notional = qty*entry
-    if notional < MIN_NOTIONAL_USDT:
-        risk_usdt = DEPOSIT_USDT*(max(RISK_PER_TRADE_BPS,30)/10000.0)  # 0.3%
-        qty = risk_usdt/risk; notional = qty*entry; note = "0.3% от депозита (для мин. ордера/усреднений)"
-    return round(notional,2), round(qty,6), note
-
-# ---------- VIP / статистика ----------
-def load_stats() -> dict:
+# ===================== Filters =====================
+async def btc_ok(session: aiohttp.ClientSession) -> bool:
+    """Если включён BTC_FILTER=on, не шортим, когда BTC в явном трендовом росте."""
+    if BTC_FILTER != "on":
+        return True
     try:
-        with open(STATS_FILE, "r", encoding="utf-8") as f: return json.load(f)
-    except Exception: return {}
+        d = await fetch_klines(session, "BTCUSDT", "15m", 40)
+        closes = [float(x[4]) for x in d]
+        if len(closes) < 20:
+            return True
+        # простая эвристика: последняя цена выше SMA(20) + 1*std — считаем "бычий импульс"
+        sma = sum(closes[-20:]) / 20.0
+        std = (sum((c - sma) ** 2 for c in closes[-20:]) / 20.0) ** 0.5
+        return not (closes[-1] > sma + std)
+    except Exception as e:
+        log.warning("btc_ok failed (ignore): %s", e)
+        return True
 
-def vip_flag(stats: dict, sym: str) -> bool:
-    s = stats.get(sym)
-    if not s: return False
-    closed, wins = int(s.get("closed",0)), int(s.get("wins",0))
-    wr = (wins/closed) if closed else 0.0
-    return closed>=20 and wr>=0.90
+async def coin_age_ok(session: aiohttp.ClientSession, symbol: str) -> bool:
+    """Монете не меньше MIN_COIN_AGE_DAYS (по 1d свечам на споте)."""
+    if MIN_COIN_AGE_DAYS <= 0:
+        return True
+    try:
+        d = await fetch_klines(session, symbol, "1d", min(1000, MIN_COIN_AGE_DAYS + 5))
+        return len(d) >= MIN_COIN_AGE_DAYS
+    except Exception as e:
+        log.warning("coin_age_ok %s failed (ignore): %s", symbol, e)
+        return True
 
-def fmt_stats(s: Optional[dict]) -> str:
-    if not s: return "Статистика: нет данных."
-    p15, p4h, p24h, p3d = s.get("p15m",0), s.get("p4h",0), s.get("p24h",0), s.get("p3d",0)
-    nohit, closed, wins = s.get("nohit",0), s.get("closed",0), s.get("wins",0)
-    wr = (wins/closed*100) if closed else 0.0
-    return (f"Статистика прибыльных:\n"
-            f"• За 15 мин: {p15}\n• За 4 часа: {p4h}\n• За 24 часа: {p24h}\n• За 3 дня: {p3d}\n"
-            f"Без отработки: {nohit}\nВинрейт: {wr:.2f}%")
-
-# ---------- ОСНОВНОЙ ЦИКЛ ----------
+# ===================== Core loop =====================
 async def scanner_loop(bot, chat_id: int):
-    await bot.send_message(chat_id=chat_id, text="🛰 Scanner online: MEXC Futures (USDT-perps) • Signals from SPOT(USDT)")
-    log.info("CFG: pump=%.2f%% rsi_min=%s scan=%ds R=%.2f entry=%s deposit=%.2f source=%s spot_req=%s",
-             PUMP_THRESHOLD*100, RSI_MIN, SCAN_INTERVAL, TAKE_PROFIT_R, ENTRY_MODE, DEPOSIT_USDT, SIGNAL_SOURCE, REQUIRE_SPOT_USDT)
+    global _sent_startup_ping
+
+    if STARTUP_PING and not _sent_startup_ping:
+        try:
+            await tg_send_message(
+                bot,
+                chat_id=chat_id,
+                text="🛰 Scanner online: MEXC 1m • RSI фильтр"
+            )
+        except Exception:
+            pass
+        _sent_startup_ping = True
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    last_universe_count = -1
-    last_announce_ts = 0.0
-    stats_all = load_stats()
 
     while True:
         try:
-            syms, refreshed = await fetch_futures_symbols()
-            now = time.time()
-            if refreshed and (last_universe_count != len(syms)) and (now - last_announce_ts) > 600:
-                await bot.send_message(chat_id=chat_id, text=f"🔄 Фьючерсный универс обновлён: {len(syms)} USDT-перпов")
-                last_universe_count = len(syms); last_announce_ts = now
+            symbols, refreshed = await fetch_symbols()
+            if refreshed:
+                await tg_send_message(
+                    bot, chat_id=chat_id,
+                    text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
+                )
 
-            if not syms:
-                await asyncio.sleep(10); continue
+            if not symbols:
+                await asyncio.sleep(10)
+                continue
 
-            async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT)) as s:
+                # BTC фильтр
+                if not await btc_ok(s):
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
 
-                # BTC-фильтр
-                if not await btc_ok(session):
-                    await asyncio.sleep(SCAN_INTERVAL); continue
-
-                async def worker(sym_in: str):
+                async def handle(sym: str):
                     async with sem:
                         try:
-                            sym = _canon(sym_in) or sym_in
+                            # возраст монеты
+                            if not await coin_age_ok(s, sym):
+                                return
 
-                            # Возраст / тренд / риск дневных пампов / VIP
-                            if not await coin_age_ok(session, sym): return
-                            risk_pumps = await daily_pump_risk(session, sym)
-                            if REQUIRE_MONTHLY_DOWNTREND and not await monthly_downtrend(session, sym): return
-                            if REQUIRE_VIP_STATS and not vip_flag(stats_all, sym): return
+                            data = await fetch_klines(s, sym, "1m", 40)
+                            if not isinstance(data, list) or len(data) < 20:
+                                return
 
-                            # Сигнальные свечи: SPOT(USDT) по умолчанию
-                            m1 = await _klines_signal(session, sym, "1m", 180)
-                            if not isinstance(m1, list) or len(m1) < 20: return
-                            closes = [float(x[4]) for x in m1]
-                            highs  = [float(x[2]) for x in m1]
-                            lows   = [float(x[3]) for x in m1]
+                            closes = [float(x[4]) for x in data]
                             prev_c, last_c = closes[-2], closes[-1]
-                            if prev_c <= 0: return
+                            if prev_c <= 0:
+                                return
 
                             change = (last_c - prev_c) / prev_c
                             rsi = calc_rsi(closes, 14)
-                            if rsi is None or change < PUMP_THRESHOLD or rsi < RSI_MIN: return
-
-                            # Уровни S/R → вход/стоп/тейк
-                            df = klines_to_df(m1[-120:])
-                            srl = compute_sr_levels(df, lookback=3, tolerance_ratio=0.002, max_levels=6)
-                            entry, stop, take, label = pick_short_entry(highs, lows, closes, srl)
-                            notional, qty, note = position_size(entry, stop)
-
-                            # Лимиты по открытым и марже
-                            _prune_open(time.time())
-                            future_margin_bps = _open_margin_bps() + 10000.0*notional/max(1e-9,DEPOSIT_USDT)
-                            if _open_count_total() >= 3 or _open_count_symbol(sym) >= 2 or future_margin_bps > MARGIN_CAP_BPS:
+                            if rsi is None:
                                 return
 
-                            # Анти-спам по символу
-                            async with _last_sent_lock:
-                                last = _last_sent.get(sym, 0.0)
-                                if time.time() - last < COOLDOWN_SEC: return
-                                _last_sent[sym] = time.time()
-                            _open.append({"sym": sym, "ts": time.time(), "notional": notional})
+                            if change >= PUMP_THRESHOLD and rsi >= RSI_MIN:
+                                # --- антиспам по символу ---
+                                now = time.time()
+                                async with _last_sent_lock:
+                                    last = _last_sent.get(sym, 0.0)
+                                    if now - last < COOLDOWN_SEC:
+                                        return
+                                    _last_sent[sym] = now
+                                # ----------------------------
 
-                            # Контрактная инфа (для текста/рисков по фьючам)
-                            vol24, _ = await get_24h_contract(session, sym)
-                            fund = await get_funding_rate(session, sym)
-                            lev  = await get_max_leverage(session, sym)
-                            fund_warn = (fund is not None and abs(fund) > (FUNDING_MAX_BPS/10000.0))
+                                pct = round(change * 100, 2)
 
-                            # Форматирование
-                            lev_str  = f"x{lev}" if lev else "—"
-                            vol_str  = f"~${round((vol24 or 0)/1e6, 2)}M" if vol24 else "—"
-                            fund_str = f"{fund*100:.4f}%" if fund is not None else "n/a"
+                                mexc_url = f"https://www.mexc.com/exchange/{sym.replace(QUOTE,'')}_{QUOTE}"
+                                tv_url   = f"https://www.tradingview.com/chart/?symbol=MEXC:{sym}"
 
-                            # Рендер графика (SPOT свечи + S/R + ENTRY/STOP/TAKE + swing-high)
-                            try:
-                                img = render_chart_image(sym, m1, levels=srl, entry=entry, stop=stop, take=take, mark_swings=True)
-                            except Exception:
-                                log.exception("chart render %s", sym)
+                                # Текст сигнала
+                                lines = [
+                                    f"🚨 Аномальный памп: +{pct}% за 1 мин",
+                                    f"📉 Монета: {sym}",
+                                    f"💵 Цена: {last_c}",
+                                    "",
+                                    "📊 Условия:",
+                                    f"✅ RSI: {rsi:.2f} (мин {int(RSI_MIN)})",
+                                    f"✅ Порог пампа: {int(PUMP_THRESHOLD * 100)}%",
+                                    "🕒 Таймфрейм: 1m",
+                                    "",
+                                    "🎯 SHORT (MVP)",
+                                    "💰 Риск: 0.1% | Тейк: 250%"
+                                ]
+                                text = "\n".join(lines)
+
+                                kb = InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("🔘 Открыть сделку на MEXC", url=mexc_url)],
+                                    [InlineKeyboardButton("📈 TradingView", url=tv_url)],
+                                ])
+
+                                # Рендер графика (если доступен charts.py)
                                 img = None
+                                if HAVE_CHARTS:
+                                    try:
+                                        df = klines_to_df(data, symbol=sym, interval="1m")
+                                        sr = compute_sr_levels(df)
+                                        img = render_chart_image(symbol=sym, df=df, sr_levels=sr, title=f"{sym} • 1m • S/R levels")
+                                    except Exception as e:
+                                        log.warning("chart render failed for %s: %s", sym, e)
+                                        img = None
 
-                            vip = vip_flag(stats_all, sym)
-                            s_sym = stats_all.get(sym)
+                                if img is not None:
+                                    await tg_send_photo(
+                                        bot,
+                                        chat_id=chat_id,
+                                        photo=img,
+                                        caption=text,
+                                        parse_mode=ParseMode.HTML,
+                                        reply_markup=kb,
+                                    )
+                                else:
+                                    await tg_send_message(
+                                        bot,
+                                        chat_id=chat_id,
+                                        text=text,
+                                        parse_mode=ParseMode.HTML,
+                                        reply_markup=kb,
+                                        disable_web_page_preview=True,
+                                    )
 
-                            header = "#VIP⭐\n\n" if vip else ""
-                            header += f"{sym} — PUMP +{round(change*100,2)}% ({prev_c} → {last_c})\n"
-                            lines = [
-                                f"Плечо: {lev_str} • рекоменд. ≤50×",
-                                f"Макс. вход: ${notional:.2f}",
-                                f"Объём 24h: {vol_str}",
-                                f"Фандинг: {fund_str}",
-                                f"RSI: {rsi:.2f}",
-                                f"Открытых позиций: всего {_open_count_total()} • по {sym}: {_open_count_symbol(sym)}",
-                                "",
-                                f"ENTRY: <b>{entry}</b>   STOP: <b>{stop}</b>   TAKE: <b>{take}</b>  (~{TAKE_PROFIT_R:.1f}R)",
-                                f"Риск: {note} → ~<b>{notional} USDT</b> (≈ {qty} {sym.replace(QUOTE,'')})",
-                                f"DCA: -{int(DCA1_BPS/10)}‰ / -{int(DCA2_BPS/10)}‰ (после усреднения — тейк 200–250%)",
-                                "",
-                                (fmt_stats(s_sym) if s_sym else "Статистика: нет данных.")
-                            ]
-                            warns = []
-                            if risk_pumps: warns.append("⚠️ Бывали суточные пампы ≥50% — высокий риск, готовь DCA.")
-                            if fund_warn:  warns.append("⚠️ Высокий фандинг — избегай или закрывайся в б/у за 10 мин до расчёта.")
-                            if warns: lines += ["", *warns]
+                        except Exception as e:
+                            # локальную ошибку символа не даём уронить проход
+                            log.debug("worker error %s: %s", sym, e)
 
-                            caption = header + "\n".join(lines)
+                tasks = [asyncio.create_task(handle(sym)) for sym in symbols]
+                await asyncio.gather(*tasks)
 
-                            kb = InlineKeyboardMarkup([
-                                [InlineKeyboardButton("🔘 MEXC Futures", url=mexc_futures_url(sym)),
-                                 InlineKeyboardButton("📈 TradingView", url=tv_url(sym))]
-                            ])
+        except Exception as e:
+            log.error("scanner_loop tick failed: %s", e)
 
-                            if img:
-                                await bot.send_photo(chat_id=chat_id, photo=img, caption=caption,
-                                                     reply_markup=kb, parse_mode=ParseMode.HTML)
-                            else:
-                                await bot.send_message(chat_id=chat_id, text=caption+"\n"+mexc_futures_url(sym),
-                                                       reply_markup=kb, parse_mode=ParseMode.HTML,
-                                                       disable_web_page_preview=True)
-                        except Exception:
-                            log.exception("worker error %s", sym_in)
-
-            await asyncio.sleep(SCAN_INTERVAL)
-
-        except asyncio.CancelledError:
-            log.info("scanner_loop cancelled, shutting down gracefully")
-            break
-        except Exception:
-            log.exception("scanner_loop tick failed")
-            await asyncio.sleep(SCAN_INTERVAL)
+        await asyncio.sleep(SCAN_INTERVAL)
