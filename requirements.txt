@@ -1,4 +1,8 @@
 python-telegram-bot[webhooks]==21.6
 aiohttp
 requests
-numpy
+aiohttp>=3.9.5
+pandas>=2.0.3
+numpy>=1.26
+matplotlib>=3.8
+mplfinance>=0.12.10b0
