@@ -230,10 +230,9 @@ async def scanner_loop(bot, chat_id: int):
     while True:
         try:
             symbols, refreshed = await fetch_symbols()
-            if refreshed:
-                await tg_send_message(
-                    bot, chat_id=chat_id,
-                    text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
+if refreshed and symbols:
+    await tg_send_message(bot, chat_id=chat_id,
+                          text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
                 )
 
             if not symbols:
