@@ -19,7 +19,7 @@ MAX_CONCURRENCY    = int(os.getenv("MAX_CONCURRENCY", "8"))
 COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", "900"))
 
 # Риск-менеджмент
-DEPOSIT_USDT       = float(os.getenv("DEPOSIT_USDT", "100"))       # <— по умолчанию 100
+DEPOSIT_USDT       = float(os.getenv("DEPOSIT_USDT", "100"))       # дефолт 100
 RISK_PER_TRADE_BPS = float(os.getenv("RISK_PER_TRADE_BPS", "10"))  # 0.1%
 MARGIN_CAP_BPS     = float(os.getenv("MARGIN_CAP_BPS", "100"))     # ≤1% суммарно
 MIN_NOTIONAL_USDT  = float(os.getenv("MIN_NOTIONAL_USDT", "5"))
@@ -92,7 +92,6 @@ def spot_to_contract(sym: str) -> str:
     return f"{sym.replace(QUOTE,'')}_{QUOTE}"
 
 def mexc_futures_url(sym: str) -> str:
-    # Ссылка на страницу фьючерсной торговли
     base = sym.replace(QUOTE,'')
     return f"https://www.mexc.com/exchange/{base}_{QUOTE}?type=perpetual"
 
@@ -108,13 +107,15 @@ async def _spot_usdt_candidates(session: aiohttp.ClientSession) -> List[str]:
         raw = info.get("symbols") or []
         out = [x["symbol"] for x in raw if x.get("status")=="TRADING" and x.get("quoteAsset")==QUOTE]
         if out: return sorted(set(out))
-    except Exception: pass
+    except Exception:
+        pass
     # 2) /ticker/price
     try:
         prices = await _get_json(session, f"{SPOT_API}/ticker/price")
         out = [it["symbol"] for it in prices if isinstance(it,dict) and str(it.get("symbol","")).endswith(QUOTE)]
         return sorted(set(out))
-    except Exception: pass
+    except Exception:
+        pass
     # 3) open/api/v2 (BTC_USDT → BTCUSDT)
     try:
         j = await _get_json(session, f"{OPEN_API}/market/symbols")
@@ -134,16 +135,14 @@ async def _spot_usdt_candidates(session: aiohttp.ClientSession) -> List[str]:
 async def _contract_exists(session: aiohttp.ClientSession, sym: str) -> bool:
     """Проверяем, что у SPOT-символа есть USDT-перп контракт."""
     c = spot_to_contract(sym)
-    # пробуем несколько эндпоинтов, любой «живой» сигнал — ок
     endpoints = [
-        ("detail", {"symbol": c}),              # /detail?symbol=BTC_USDT
-        ("ticker", {"symbol": c}),              # /ticker?symbol=BTC_USDT
-        ("indexPrice", {"symbol": c}),          # /indexPrice?symbol=BTC_USDT
+        ("detail", {"symbol": c}),
+        ("ticker", {"symbol": c}),
+        ("indexPrice", {"symbol": c}),
     ]
     for ep, params in endpoints:
         try:
             j = await _get_json(session, f"{CONTRACT_API}/{ep}", **params)
-            # ответ с "data" обычно означает валидный контракт
             if isinstance(j, dict) and j.get("data") not in (None, []):
                 return True
         except Exception:
@@ -167,7 +166,6 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
                 log.warning("No spot candidates; futures universe not refreshed (backoff 5m).")
                 return _fut_syms, False
 
-            # проверяем кандидатов на наличие перпа (ограничим пулы параллельностью)
             sem = asyncio.Semaphore(20)
             fut: List[str] = []
             async def check(sym: str):
@@ -194,7 +192,7 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
 
 # ---------- ДАННЫЕ / ИНДИКАТОРЫ ----------
 async def spot_klines_1m(session: aiohttp.ClientSession, sym: str, limit: int = 180):
-    # контрактные свечи нестабильны по API — используем спот-цены как прокси для RSI/пампа/графика
+    # контрактные свечи бывают нестабильны по API — используем спот-цены как прокси для RSI/пампа/графика
     return await _get_json(session, f"{SPOT_API}/klines", symbol=sym, interval="1m", limit=str(limit))
 
 async def get_24h_contract(session: aiohttp.ClientSession, sym: str) -> tuple[Optional[float], Optional[float]]:
@@ -204,7 +202,6 @@ async def get_24h_contract(session: aiohttp.ClientSession, sym: str) -> tuple[Op
         try:
             j = await _get_json(session, f"{CONTRACT_API}/{ep}", symbol=c)
             d = j.get("data") or {}
-            # возможные ключи
             qv = d.get("quoteVol") or d.get("turnover") or d.get("quoteVolume")
             pch = d.get("riseFallRate") or d.get("priceChangePercent")
             return (float(qv) if qv is not None else None,
@@ -269,7 +266,6 @@ def calc_atr(high: List[float], low: List[float], close: List[float], period: in
         atr = (atr*(period-1)+trs[i])/period
     return atr
 
-# регрессия-наклон
 def _slope(vals: List[float]) -> float:
     n = len(vals)
     if n < 2: return 0.0
@@ -353,7 +349,7 @@ def load_stats() -> dict:
     except Exception: return {}
 
 def vip_flag(stats: dict, sym: str) -> bool:
-    s = stats.get(sym); 
+    s = stats.get(sym)
     if not s: return False
     closed, wins = int(s.get("closed",0)), int(s.get("wins",0))
     wr = (wins/closed) if closed else 0.0
@@ -401,10 +397,12 @@ async def scanner_loop(bot, chat_id: int):
                 async def worker(sym: str):
                     async with sem:
                         try:
-                            # Возраст / тренд / риск дневных пампов
+                            # Возраст / тренд / риск дневных пампов / VIP
                             if not await coin_age_ok(session, sym): return
                             risk_pumps = await daily_pump_risk(session, sym)
-                            if REQUIRE_MONTHLY_DOWNTREND and not await monthly_downtrend(session, sym): return
+                            if REQUIRE_MONTHLY_DOWN
+
+trend and not await monthly_downtrend(session, sym): return
                             if REQUIRE_VIP_STATS and not vip_flag(stats_all, sym): return
 
                             # 1m спот-свечи как прокси
@@ -446,9 +444,17 @@ async def scanner_loop(bot, chat_id: int):
 
                             fund_warn = (fund is not None and abs(fund) > (FUNDING_MAX_BPS/10000.0))
 
+                            # Безопасные строки для форматирования
+                            lev_str  = f"x{lev}" if lev else "—"
+                            vol_str  = f"~${round(vol24/1e6, 2)}M" if vol24 else "—"
+                            fund_str = f"{fund*100:.4f}%" if fund is not None else "n/a"
+
                             # Рендер графика
-                            try: img = render_chart_image(sym, m1)
-                            except Exception: log.exception("chart render %s", sym); img = None
+                            try:
+                                img = render_chart_image(sym, m1)
+                            except Exception:
+                                log.exception("chart render %s", sym)
+                                img = None
 
                             vip = vip_flag(stats_all, sym)
                             s_sym = stats_all.get(sym)
@@ -456,10 +462,10 @@ async def scanner_loop(bot, chat_id: int):
                             header = "#VIP⭐\n\n" if vip else ""
                             header += f"{sym} — PUMP +{round(change*100,2)}% ({prev_c} → {last_c})\n"
                             lines = [
-                                f"Плечо: {(f'x{lev}' if lev else '—')} • рекоменд. ≤50×",
+                                f"Плечо: {lev_str} • рекоменд. ≤50×",
                                 f"Макс. вход: ${notional:.2f}",
-                                f"Объём 24h: {('~$'+str(round(vol24/1e6,2))+'M') if vol24 else '—'}",
-                                f"Фандинг: {((fund*100):.4f)+'%' if fund is not None else 'n/a'}",
+                                f"Объём 24h: {vol_str}",
+                                f"Фандинг: {fund_str}",
                                 f"RSI: {rsi:.2f}",
                                 f"Открытых позиций: всего {_open_count_total()} • по {sym}: {_open_count_symbol(sym)}",
                                 "",
