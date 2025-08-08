@@ -9,6 +9,7 @@ from charts import render_chart_image, klines_to_df, compute_sr_levels
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("scanner")
+UNIVERSE_REFRESH_MODE = os.getenv("UNIVERSE_REFRESH_MODE", "auto").lower()  # auto|seed|off
 
 # ---------- ENV / ПРАВИЛА ----------
 PUMP_THRESHOLD     = float(os.getenv("PUMP_THRESHOLD", "0.07"))   # 7% за 1м
@@ -218,21 +219,20 @@ async def _klines_any(session, sym: str, base_interval: str, limit: int):
     return []
 
 # ---------- СТАБИЛЬНЫЙ УНИВЕРС ПЕРПЕТУАЛОВ С КЭШЕМ/ФОЛЛБЭКАМИ ----------
-async def fetch_futures_symbols() -> tuple[List[str], bool]:
-    """
-    Возвращает список SPOT-тикеров (BTCUSDT и т.п.), у которых есть USDT-perp.
-    Стратегия:
-      1) /contract/detail (без symbol) — основной источник
-      2) если пусто/403 — фоллбэк: кандидаты со спота + проверка наличия контракта
-      3) если опять пусто — берём кэш с диска и/или семена из ENV
-    Кэш не затираем при неуспехе. Обновляем раз в SYMBOL_REFRESH_SEC. Бэкофф 5м при неудаче.
-    """
+async def fetch_futures_symbols() -> tuple[list[str], bool]:
     global _fut_syms, _last_refresh, _next_fetch_at
     now = time.time()
 
-    # Бэкофф после неудач
-    if now < _next_fetch_at:
+    # Если не auto — работаем только с кэшем/семенами и не логируем варны
+    if UNIVERSE_REFRESH_MODE in ("seed", "off"):
+        if not _fut_syms:
+            disk = _load_cached_syms()
+            if disk:
+                _fut_syms = [x for x in (_canon(y) for y in disk) if x]
+            elif FUTURES_SEED:
+                _fut_syms = [x for x in (_canon(y) for y in FUTURES_SEED) if x]
         return _fut_syms, False
+
 
     # уважение кэш-TTL
     if _fut_syms and (now - _last_refresh) < SYMBOL_REFRESH_SEC:
