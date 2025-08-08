@@ -1,58 +1,59 @@
-import os, logging, asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from scanner import scanner_loop  # <-- импорт фонового сканера
+import os
+import logging
+import asyncio
+from telegram.ext import Application, CommandHandler
+from scanner import scanner_loop
 
-TOKEN = os.environ.get("TOKEN")
-CHAT_ID = int(os.environ.get("CHAT_ID", "0"))
-PORT = int(os.environ.get("PORT", "8080"))
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "devsecret")
-WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE") or os.environ.get("RENDER_EXTERNAL_URL")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+TOKEN         = os.getenv("TOKEN")
+CHAT_ID       = int(os.getenv("CHAT_ID", "0"))
+WEBHOOK_BASE  = os.getenv("WEBHOOK_BASE")              # например: https://telegram-bot-webhook-xxxx.onrender.com
+WEBHOOK_SECRET= os.getenv("WEBHOOK_SECRET", "secret")
+PORT          = int(os.getenv("PORT", "10000"))
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong ✅")
+WEBHOOK_PATH  = f"/webhook/{WEBHOOK_SECRET}"
+WEBHOOK_URL   = (WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH) if WEBHOOK_BASE else None
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot online. Webhook + Scanner mode.")
+async def start_cmd(update, context):
+    await update.message.reply_text("I'm alive 🤖")
 
-async def on_startup(app: Application):
-    # Запускаем фоновый сканер
+async def post_init(app: Application):
+    # запускаем фоновый сканер
     if CHAT_ID:
-        asyncio.create_task(scanner_loop(app.bot, CHAT_ID))
+        app.bot_data["scanner_task"] = asyncio.create_task(scanner_loop(app.bot, CHAT_ID))
+        logging.info("scanner_task started")
+    else:
+        logging.warning("CHAT_ID is not set; scanner won't start")
+
+async def post_shutdown(app: Application):
+    # корректно останавливаем сканер
+    task = app.bot_data.get("scanner_task")
+    if task:
+        task.cancel()
         try:
-            await app.bot.send_message(chat_id=CHAT_ID, text="🔔 Webhook bot: scanner started")
-        except Exception as e:
-            logger.exception("Failed to send startup message: %s", e)
+            await task
+        except asyncio.CancelledError:
+            logging.info("scanner_task cancelled cleanly")
 
 def main():
     if not TOKEN:
-        raise RuntimeError("No TOKEN env var provided")
+        raise RuntimeError("TOKEN is required")
+    if not WEBHOOK_URL:
+        raise RuntimeError("WEBHOOK_BASE is required")
 
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("ping", ping))
+    app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start", start_cmd))
-    app.post_init = on_startup
 
-    webhook_url = None
-    if WEBHOOK_BASE:
-        webhook_url = WEBHOOK_BASE.rstrip("/") + f"/webhook/{WEBHOOK_SECRET}"
-        logger.info("Using webhook_url: %s", webhook_url)
-    else:
-        logger.warning("WEBHOOK_BASE/RENDER_EXTERNAL_URL not set yet. Redeploy after URL appears.")
-
+    # поднимаем вебхук-сервер на $PORT
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path=f"/webhook/{WEBHOOK_SECRET}",
-        webhook_url=webhook_url,
+        url_path=WEBHOOK_PATH,
+        webhook_url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET,
-        allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
     main()
-
