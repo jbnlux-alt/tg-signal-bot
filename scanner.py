@@ -1,12 +1,11 @@
 # scanner.py
 import os
 import time
-import math
 import asyncio
 import logging
-import aiohttp
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
+import aiohttp
 from telegram.constants import ParseMode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import NetworkError, TimedOut, RetryAfter, BadRequest
@@ -20,7 +19,7 @@ SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "60"))           # сек м
 SYMBOL_REFRESH_SEC = int(os.getenv("SYMBOL_REFRESH_SEC", "86400"))   # раз в сутки обновляем список
 QUOTE              = os.getenv("QUOTE_FILTER", "USDT")               # котировка
 MAX_CONCURRENCY    = int(os.getenv("MAX_CONCURRENCY", "8"))
-COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", "900"))           # антиспам по символу
+COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", "900"))           # антиспам по символу (сек)
 STARTUP_PING       = os.getenv("STARTUP_PING", "true").lower() == "true"
 
 MIN_COIN_AGE_DAYS  = int(os.getenv("MIN_COIN_AGE_DAYS", "30"))       # не младше
@@ -28,14 +27,16 @@ BTC_FILTER         = os.getenv("BTC_FILTER", "off").lower()          # 'on'/'off
 
 DISABLE_CHARTS     = os.getenv("DISABLE_CHARTS", "false").lower() == "true"
 
-MEXC_SPOT_API      = "https://api.mexc.com/api/v3"
-
-# таймауты HTTP
 HTTP_TOTAL_TIMEOUT = int(os.getenv("HTTP_TOTAL_TIMEOUT", "15"))
-
-# ретраи телеги
 TG_MAX_ATTEMPTS    = int(os.getenv("TG_MAX_ATTEMPTS", "5"))
 TG_BACKOFF_BASE    = float(os.getenv("TG_BACKOFF_BASE", "1.5"))
+
+# ===================== HTTP endpoints & headers =====================
+MEXC_SPOT_API  = "https://api.mexc.com/api/v3"
+HTTP_HEADERS: Dict[str, str] = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) RenderBot/1.0",
+    "Accept": "application/json",
+}
 
 # ===================== Charts (optional) =====================
 HAVE_CHARTS = False
@@ -51,15 +52,14 @@ except Exception as e:
 # ===================== In-memory state =====================
 _symbols_cache: List[str] = []
 _last_reload: float = 0.0
-_symbols_backoff_until: float = 0.0  # когда можно снова дергать /exchangeInfo
+_symbols_backoff_until: float = 0.0  # когда можно снова пытаться обновлять список пар
 
-
-_last_sent: dict[str, float] = {}            # антиспам по символу
+_last_sent: Dict[str, float] = {}    # антиспам по символу
 _last_sent_lock = asyncio.Lock()
 
 _sent_startup_ping = False
 
-# ===================== Telegram helpers =====================
+# ===================== Telegram helpers (retries) =====================
 async def tg_call(bot, method: str, *args, **kwargs):
     """
     Надёжный вызов Telegram API с ретраями и экспоненциальным бэкоффом.
@@ -96,12 +96,12 @@ async def tg_send_photo(bot, **kwargs):
 # ===================== HTTP helpers =====================
 async def _fetch_json(session: aiohttp.ClientSession, url: str, **params):
     timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT)
-    async with session.get(url, params=params, timeout=timeout) as r:
+    async with session.get(url, params=params, headers=HTTP_HEADERS, timeout=timeout) as r:
         r.raise_for_status()
         return await r.json()
 
 # ===================== Data fetchers =====================
-async def fetch_symbols() -> tuple[list[str], bool]:
+async def fetch_symbols() -> Tuple[List[str], bool]:
     """
     Возвращает (symbols, refreshed_now).
     refreshed_now=True — только когда реально обновили кэш.
@@ -123,7 +123,7 @@ async def fetch_symbols() -> tuple[list[str], bool]:
         async with aiohttp.ClientSession() as s:
             info = await _fetch_json(s, f"{MEXC_SPOT_API}/exchangeInfo")
 
-        syms: list[str] = []
+        syms: List[str] = []
         for x in info.get("symbols", []):
             if x.get("status") == "TRADING" and x.get("quoteAsset") == QUOTE:
                 syms.append(x["symbol"])
@@ -131,7 +131,7 @@ async def fetch_symbols() -> tuple[list[str], bool]:
         # если пусто — не обновляем кэш, ставим бэкофф
         if not syms:
             _symbols_backoff_until = now + 300  # 5 минут
-            logging.getLogger("scanner").warning(
+            log.warning(
                 "fetch_symbols: API вернуло 0 символов; keep cache=%d, backoff 5m.",
                 len(_symbols_cache),
             )
@@ -145,12 +145,11 @@ async def fetch_symbols() -> tuple[list[str], bool]:
     except Exception as e:
         # сеть/429 и т.п. — не трогаем кэш и уходим в бэкофф
         _symbols_backoff_until = now + 300
-        logging.getLogger("scanner").warning(
+        log.warning(
             "fetch_symbols failed: %s; keep cache=%d, backoff 5m.",
             e, len(_symbols_cache),
         )
         return _symbols_cache, False
-
 
 async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int):
     # формат: /klines?symbol=BTCUSDT&interval=1m&limit=30
@@ -191,9 +190,10 @@ async def btc_ok(session: aiohttp.ClientSession) -> bool:
         closes = [float(x[4]) for x in d]
         if len(closes) < 20:
             return True
-        # простая эвристика: последняя цена выше SMA(20) + 1*std — считаем "бычий импульс"
         sma = sum(closes[-20:]) / 20.0
-        std = (sum((c - sma) ** 2 for c in closes[-20:]) / 20.0) ** 0.5
+        var = sum((c - sma) ** 2 for c in closes[-20:]) / 20.0
+        std = var ** 0.5
+        # если цена сильно выше скользящей — пропускаем шорты
         return not (closes[-1] > sma + std)
     except Exception as e:
         log.warning("btc_ok failed (ignore): %s", e)
@@ -230,9 +230,10 @@ async def scanner_loop(bot, chat_id: int):
     while True:
         try:
             symbols, refreshed = await fetch_symbols()
-if refreshed and symbols:
-    await tg_send_message(bot, chat_id=chat_id,
-                          text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
+            if refreshed and symbols:
+                await tg_send_message(
+                    bot, chat_id=chat_id,
+                    text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
                 )
 
             if not symbols:
@@ -293,7 +294,7 @@ if refreshed and symbols:
                                     "🕒 Таймфрейм: 1m",
                                     "",
                                     "🎯 SHORT (MVP)",
-                                    "💰 Риск: 0.1% | Тейк: 250%"
+                                    "💰 Риск: 0.1% | Тейк: 250%",
                                 ]
                                 text = "\n".join(lines)
 
@@ -308,7 +309,10 @@ if refreshed and symbols:
                                     try:
                                         df = klines_to_df(data, symbol=sym, interval="1m")
                                         sr = compute_sr_levels(df)
-                                        img = render_chart_image(symbol=sym, df=df, sr_levels=sr, title=f"{sym} • 1m • S/R levels")
+                                        img = render_chart_image(
+                                            symbol=sym, df=df, sr_levels=sr,
+                                            title=f"{sym} • 1m • S/R levels"
+                                        )
                                     except Exception as e:
                                         log.warning("chart render failed for %s: %s", sym, e)
                                         img = None
@@ -333,7 +337,7 @@ if refreshed and symbols:
                                     )
 
                         except Exception as e:
-                            # локальную ошибку символа не даём уронить проход
+                            # локальная ошибка символа — не рушим проход
                             log.debug("worker error %s: %s", sym, e)
 
                 tasks = [asyncio.create_task(handle(sym)) for sym in symbols]
