@@ -122,6 +122,27 @@ def _save_cached_syms(syms: List[str]) -> None:
     except Exception:
         pass
 
+# ---------- ROBUST KLINES (перебор валидных интервалов) ----------
+_INTERVAL_MAP = {
+    "1m":  ["1m"],
+    "5m":  ["5m"],
+    "60m": ["60m", "1h"],        # час
+    "4h":  ["4h", "240m"],       # 4 часа
+    "1d":  ["1d", "1D", "1440m"] # день
+}
+
+async def _spot_klines_any(session: aiohttp.ClientSession, sym: str, base_interval: str, limit: int):
+    variants = _INTERVAL_MAP.get(base_interval, [base_interval])
+    last_err = None
+    for iv in variants:
+        try:
+            return await _get_json(session, f"{SPOT_API}/klines", symbol=sym, interval=iv, limit=str(limit))
+        except Exception as e:
+            last_err = e
+            continue
+    log.warning("All variants failed for %s %s (limit=%s): %s", sym, base_interval, limit, last_err)
+    return []
+
 # ---------- СТАБИЛЬНЫЙ УНИВЕРС ПЕРПЕТУАЛОВ С КЭШЕМ/ФОЛЛБЭКАМИ ----------
 async def fetch_futures_symbols() -> tuple[List[str], bool]:
     """
@@ -227,7 +248,7 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
 # ---------- ДАННЫЕ / ИНДИКАТОРЫ ----------
 async def spot_klines_1m(session: aiohttp.ClientSession, sym: str, limit: int = 180):
     # контрактные свечи бывают нестабильны по API — используем спот-цены как прокси для RSI/пампа/графика
-    return await _get_json(session, f"{SPOT_API}/klines", symbol=sym, interval="1m", limit=str(limit))
+    return await _spot_klines_any(session, sym, "1m", limit)
 
 async def get_24h_contract(session: aiohttp.ClientSession, sym: str) -> tuple[Optional[float], Optional[float]]:
     # 24h (перп): quoteVol + priceChangePercent
@@ -310,22 +331,46 @@ def _slope(vals: List[float]) -> float:
     den = n*sx2 - sx*sx
     return 0.0 if den==0 else (n*sxy - sx*sy)/den
 
+def _resample_every(vals: List[float], step: int) -> List[float]:
+    """Берём каждый step-й элемент, начиная с последнего полного блока."""
+    if len(vals) < step: return []
+    cut = (len(vals)//step)*step
+    sliced = vals[-cut:]
+    return [sliced[i] for i in range(step-1, len(sliced), step)]
+
 # Фильтры стратегии
 async def coin_age_ok(session: aiohttp.ClientSession, sym: str) -> bool:
-    d1 = await _get_json(session, f"{SPOT_API}/klines", symbol=sym, interval="1d", limit=str(MIN_COIN_AGE_DAYS+5))
-    return isinstance(d1, list) and len(d1) >= MIN_COIN_AGE_DAYS
+    # Сначала пробуем 1d разными вариантами; если не вышло — считаем «дней» через 4h (6 свечей = 1 день)
+    d1 = await _spot_klines_any(session, sym, "1d", MIN_COIN_AGE_DAYS + 5)
+    if isinstance(d1, list) and len(d1) >= MIN_COIN_AGE_DAYS:
+        return True
+    h4 = await _spot_klines_any(session, sym, "4h", (MIN_COIN_AGE_DAYS + 5)*6)
+    if isinstance(h4, list) and len(h4) >= MIN_COIN_AGE_DAYS*6:
+        return True
+    # если вообще нет истории — безопасно отклоняем
+    return False
 
 async def monthly_downtrend(session: aiohttp.ClientSession, sym: str) -> bool:
     if not REQUIRE_MONTHLY_DOWNTREND: return True
-    d1 = await _get_json(session, f"{SPOT_API}/klines", symbol=sym, interval="1d", limit="40")
-    if not isinstance(d1, list) or len(d1) < 25: return False
-    closes = [float(x[4]) for x in d1][-30:]
-    if len(closes) < 20: return False
+    # daily → 30 последних закрытий; иначе ресемпл 4h → daily
+    d1 = await _spot_klines_any(session, sym, "1d", 40)
+    closes: List[float] = []
+    if isinstance(d1, list) and len(d1) >= 25:
+        closes = [float(x[4]) for x in d1][-30:]
+    else:
+        h4 = await _spot_klines_any(session, sym, "4h", 30*6 + 10)
+        if not isinstance(h4, list) or len(h4) < 30*6:
+            return False
+        c4 = [float(x[4]) for x in h4][-30*6:]
+        closes = _resample_every(c4, 6)
+        if len(closes) < 20:
+            return False
     return _slope(closes) < 0
 
 async def daily_pump_risk(session: aiohttp.ClientSession, sym: str) -> bool:
-    d1 = await _get_json(session, f"{SPOT_API}/klines", symbol=sym, interval="1d", limit="60")
-    if not isinstance(d1, list) or len(d1) < 2: return False
+    d1 = await _spot_klines_any(session, sym, "1d", 60)
+    if not isinstance(d1, list) or len(d1) < 2: 
+        return False
     c = [float(x[4]) for x in d1]
     thr = ABNORMAL_DAILY_PUMP_BPS/10000.0
     return any(abs((c[i]-c[i-1])/max(1e-12,c[i-1])) >= thr for i in range(1,len(c)))
@@ -335,7 +380,7 @@ async def btc_ok(session: aiohttp.ClientSession) -> bool:
     if not BTC_FILTER:
         return True
     try:
-        m5 = await _get_json(session, f"{SPOT_API}/klines", symbol="BTCUSDT", interval="5m", limit="24")
+        m5 = await _spot_klines_any(session, "BTCUSDT", "5m", 24)
         if not isinstance(m5, list) or len(m5) < 4:
             return True
         c5 = [float(x[4]) for x in m5]
@@ -344,7 +389,7 @@ async def btc_ok(session: aiohttp.ClientSession) -> bool:
         return True
     slope60 = 0.0
     try:
-        h1 = await _get_json(session, f"{SPOT_API}/klines", symbol="BTCUSDT", interval="60m", limit="30")
+        h1 = await _spot_klines_any(session, "BTCUSDT", "60m", 30)
         if isinstance(h1, list) and len(h1) >= 10:
             c60 = [float(x[4]) for x in h1][-20:]
             slope60 = _slope(c60)
@@ -489,7 +534,7 @@ async def scanner_loop(bot, chat_id: int):
 
                             # Безопасные строки для форматирования
                             lev_str  = f"x{lev}" if lev else "—"
-                            vol_str  = f"~${round(vol24/1e6, 2)}M" if vol24 else "—"
+                            vol_str  = f"~${round((vol24 or 0)/1e6, 2)}M" if vol24 else "—"
                             fund_str = f"{fund*100:.4f}%" if fund is not None else "n/a"
 
                             # Рендер графика
