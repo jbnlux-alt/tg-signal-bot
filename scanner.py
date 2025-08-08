@@ -71,7 +71,7 @@ _last_sent_lock = asyncio.Lock()
 # список фьючерсных символов (в формате SPOT: BTCUSDT). Кэш.
 _fut_syms: List[str] = []
 _last_refresh = 0.0
-_next_fetch_at = 0.0
+_next_fetch_at = 0.0  # чтобы не долбить API после неудачи (бэкофф)
 
 # Учёт «открытых» сигналов (для лимитов)
 _open: List[dict] = []  # {sym, ts, notional}
@@ -122,25 +122,52 @@ def _save_cached_syms(syms: List[str]) -> None:
     except Exception:
         pass
 
-# ---------- ROBUST KLINES (перебор валидных интервалов) ----------
-_INTERVAL_MAP = {
+# ---------- ROBUST KLINES (спот или фьючерсы, что доступно) ----------
+_INTERV_SPOT = {
     "1m":  ["1m"],
     "5m":  ["5m"],
-    "60m": ["60m", "1h"],        # час
-    "4h":  ["4h", "240m"],       # 4 часа
-    "1d":  ["1d", "1D", "1440m"] # день
+    "60m": ["60m"],
+    "4h":  ["4h"],
+    "1d":  ["1d"],
 }
+_CONTRACT_IV = {"1m":"Min1", "5m":"Min5", "60m":"Min60", "4h":"Hour4", "1d":"Day1"}
+_CONTRACT_IV_SEC = {"Min1":60, "Min5":300, "Min60":3600, "Hour4":14400, "Day1":86400}
 
-async def _spot_klines_any(session: aiohttp.ClientSession, sym: str, base_interval: str, limit: int):
-    variants = _INTERVAL_MAP.get(base_interval, [base_interval])
-    last_err = None
-    for iv in variants:
+async def _klines_spot(session, sym: str, base_interval: str, limit: int):
+    for iv in _INTERV_SPOT.get(base_interval, [base_interval]):
         try:
             return await _get_json(session, f"{SPOT_API}/klines", symbol=sym, interval=iv, limit=str(limit))
-        except Exception as e:
-            last_err = e
+        except Exception:
             continue
-    log.warning("All variants failed for %s %s (limit=%s): %s", sym, base_interval, limit, last_err)
+    return []
+
+async def _klines_contract(session, sym: str, base_interval: str, limit: int):
+    ci = _CONTRACT_IV.get(base_interval)
+    if not ci:
+        return []
+    try:
+        c = spot_to_contract(sym)  # BTCUSDT -> BTC_USDT
+        j = await _get_json(session, f"{CONTRACT_API}/kline/{c}", interval=ci)
+        d = j.get("data") or {}
+        t, o, h, l, c_, v = (d.get("time") or []), (d.get("open") or []), (d.get("high") or []), (d.get("low") or []), (d.get("close") or []), (d.get("vol") or [])
+        sec = _CONTRACT_IV_SEC[ci]
+        rows = []
+        for i in range(min(len(t), len(o), len(h), len(l), len(c_), len(v))):
+            ot = int(t[i]) * 1000
+            ct = ot + sec * 1000
+            rows.append([ot, str(o[i]), str(h[i]), str(l[i]), str(c_[i]), str(v[i]), ct, "0", "0", 0, "0"])
+        return rows[-limit:] if limit else rows
+    except Exception:
+        return []
+
+async def _klines_any(session, sym: str, base_interval: str, limit: int):
+    data = await _klines_spot(session, sym, base_interval, limit)
+    if data:
+        return data
+    data = await _klines_contract(session, sym, base_interval, limit)
+    if data:
+        return data
+    log.warning("No klines from spot/contract for %s %s (limit=%s)", sym, base_interval, limit)
     return []
 
 # ---------- СТАБИЛЬНЫЙ УНИВЕРС ПЕРПЕТУАЛОВ С КЭШЕМ/ФОЛЛБЭКАМИ ----------
@@ -151,10 +178,14 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
       1) /contract/detail (без symbol) — основной источник
       2) если пусто/403 — фоллбэк: кандидаты со спота + проверка наличия контракта
       3) если опять пусто — берём кэш с диска и/или семена из ENV
-    Кэш не затираем при неуспехе. Обновляем раз в SYMBOL_REFRESH_SEC.
+    Кэш не затираем при неуспехе. Обновляем раз в SYMBOL_REFRESH_SEC. Бэкофф 5м при неудаче.
     """
     global _fut_syms, _last_refresh, _next_fetch_at
     now = time.time()
+
+    # Бэкофф после неудач
+    if now < _next_fetch_at:
+        return _fut_syms, False
 
     # уважение кэш-TTL
     if _fut_syms and (now - _last_refresh) < SYMBOL_REFRESH_SEC:
@@ -216,7 +247,7 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
         except Exception as e:
             log.warning("fallback spot->contract failed: %s", e)
 
-    # 3) если снова пусто — не обнуляем, держим кэш/семена
+    # 3) если снова пусто — не обнуляем, держим кэш/семена, ставим бэкофф
     if not new_list:
         if _fut_syms:
             _next_fetch_at = now + 300 + random.randint(0,60)
@@ -247,8 +278,8 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
 
 # ---------- ДАННЫЕ / ИНДИКАТОРЫ ----------
 async def spot_klines_1m(session: aiohttp.ClientSession, sym: str, limit: int = 180):
-    # контрактные свечи бывают нестабильны по API — используем спот-цены как прокси для RSI/пампа/графика
-    return await _spot_klines_any(session, sym, "1m", limit)
+    # контрактные свечи бывают нестабильны по API — используем спот-цены как прокси; если нет, берём перпы
+    return await _klines_any(session, sym, "1m", limit)
 
 async def get_24h_contract(session: aiohttp.ClientSession, sym: str) -> tuple[Optional[float], Optional[float]]:
     # 24h (перп): quoteVol + priceChangePercent
@@ -338,27 +369,25 @@ def _resample_every(vals: List[float], step: int) -> List[float]:
     sliced = vals[-cut:]
     return [sliced[i] for i in range(step-1, len(sliced), step)]
 
-# Фильтры стратегии
+# ---------- ФИЛЬТРЫ СТРАТЕГИИ ----------
 async def coin_age_ok(session: aiohttp.ClientSession, sym: str) -> bool:
-    # Сначала пробуем 1d разными вариантами; если не вышло — считаем «дней» через 4h (6 свечей = 1 день)
-    d1 = await _spot_klines_any(session, sym, "1d", MIN_COIN_AGE_DAYS + 5)
+    # 1d; если 400 — 4h и считаем «дни» как 6 свечей 4h = 1d
+    d1 = await _klines_any(session, sym, "1d", MIN_COIN_AGE_DAYS + 5)
     if isinstance(d1, list) and len(d1) >= MIN_COIN_AGE_DAYS:
         return True
-    h4 = await _spot_klines_any(session, sym, "4h", (MIN_COIN_AGE_DAYS + 5)*6)
+    h4 = await _klines_any(session, sym, "4h", (MIN_COIN_AGE_DAYS + 5)*6)
     if isinstance(h4, list) and len(h4) >= MIN_COIN_AGE_DAYS*6:
         return True
-    # если вообще нет истории — безопасно отклоняем
     return False
 
 async def monthly_downtrend(session: aiohttp.ClientSession, sym: str) -> bool:
     if not REQUIRE_MONTHLY_DOWNTREND: return True
-    # daily → 30 последних закрытий; иначе ресемпл 4h → daily
-    d1 = await _spot_klines_any(session, sym, "1d", 40)
+    d1 = await _klines_any(session, sym, "1d", 40)
     closes: List[float] = []
     if isinstance(d1, list) and len(d1) >= 25:
         closes = [float(x[4]) for x in d1][-30:]
     else:
-        h4 = await _spot_klines_any(session, sym, "4h", 30*6 + 10)
+        h4 = await _klines_any(session, sym, "4h", 30*6 + 10)
         if not isinstance(h4, list) or len(h4) < 30*6:
             return False
         c4 = [float(x[4]) for x in h4][-30*6:]
@@ -368,19 +397,19 @@ async def monthly_downtrend(session: aiohttp.ClientSession, sym: str) -> bool:
     return _slope(closes) < 0
 
 async def daily_pump_risk(session: aiohttp.ClientSession, sym: str) -> bool:
-    d1 = await _spot_klines_any(session, sym, "1d", 60)
-    if not isinstance(d1, list) or len(d1) < 2: 
+    d1 = await _klines_any(session, sym, "1d", 60)
+    if not isinstance(d1, list) or len(d1) < 2:
         return False
     c = [float(x[4]) for x in d1]
     thr = ABNORMAL_DAILY_PUMP_BPS/10000.0
     return any(abs((c[i]-c[i-1])/max(1e-12,c[i-1])) >= thr for i in range(1,len(c)))
 
 async def btc_ok(session: aiohttp.ClientSession) -> bool:
-    """BTC в коррекции/флэте: 15m изменение ≤0.5% ИЛИ 60m наклон ≤0. На MEXC часовой интервал — '60m'."""
+    """BTC: 15m изменение ≤0.5% ИЛИ 60m наклон ≤0. Час на MEXC — '60m'."""
     if not BTC_FILTER:
         return True
     try:
-        m5 = await _spot_klines_any(session, "BTCUSDT", "5m", 24)
+        m5 = await _klines_any(session, "BTCUSDT", "5m", 24)
         if not isinstance(m5, list) or len(m5) < 4:
             return True
         c5 = [float(x[4]) for x in m5]
@@ -389,7 +418,7 @@ async def btc_ok(session: aiohttp.ClientSession) -> bool:
         return True
     slope60 = 0.0
     try:
-        h1 = await _spot_klines_any(session, "BTCUSDT", "60m", 30)
+        h1 = await _klines_any(session, "BTCUSDT", "60m", 30)
         if isinstance(h1, list) and len(h1) >= 10:
             c60 = [float(x[4]) for x in h1][-20:]
             slope60 = _slope(c60)
@@ -397,7 +426,7 @@ async def btc_ok(session: aiohttp.ClientSession) -> bool:
         pass
     return (abs(chg15) <= 0.005) or (slope60 <= 0)
 
-# Entry/Stop/Take (SHORT)
+# ---------- Entry/Stop/Take (SHORT) ----------
 def pick_short_entry(high: List[float], low: List[float], close: List[float], levels: List[float]) -> tuple[float,float,float,str]:
     last_c = close[-1]; prev_low = low[-2]; prev_high = high[-2]
     off = ENTRY_OFFSET_BPS/10000.0; buf = STOP_BUFFER_BPS/10000.0
@@ -432,7 +461,7 @@ def position_size(entry: float, stop: float) -> tuple[float,float,str]:
         qty = risk_usdt/risk; notional = qty*entry; note = "0.3% от депозита (для мин. ордера/усреднений)"
     return round(notional,2), round(qty,6), note
 
-# VIP / статистика
+# ---------- VIP / статистика ----------
 def load_stats() -> dict:
     try:
         with open(STATS_FILE, "r", encoding="utf-8") as f: return json.load(f)
@@ -458,7 +487,6 @@ def fmt_stats(s: Optional[dict]) -> str:
 async def scanner_loop(bot, chat_id: int):
     # приветствие
     await bot.send_message(chat_id=chat_id, text="🛰 Scanner online: MEXC Futures (USDT-perps) • RSI/SR")
-
     log.info("CFG: pump=%.2f%% rsi_min=%s scan=%ds R=%.2f entry=%s deposit=%.2f",
              PUMP_THRESHOLD*100, RSI_MIN, SCAN_INTERVAL, TAKE_PROFIT_R, ENTRY_MODE, DEPOSIT_USDT)
 
@@ -493,7 +521,7 @@ async def scanner_loop(bot, chat_id: int):
                             if REQUIRE_MONTHLY_DOWNTREND and not await monthly_downtrend(session, sym): return
                             if REQUIRE_VIP_STATS and not vip_flag(stats_all, sym): return
 
-                            # 1m спот-свечи как прокси
+                            # 1m клины как прокси
                             m1 = await spot_klines_1m(session, sym, 180)
                             if not isinstance(m1, list) or len(m1) < 20: return
                             closes = [float(x[4]) for x in m1]
