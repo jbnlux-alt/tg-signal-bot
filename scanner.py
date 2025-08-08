@@ -1,4 +1,9 @@
-# scanner.py
+# scanner.py — устойчивый сканер MEXC (спот 1m) для сигналов шорта
+# - ретраи отправки в Telegram
+# - бэкофф и резервный список тикеров (FUTURES_SEED), если MEXC вернул 0
+# - User-Agent/Accept заголовки против антибот-фильтров
+# - опциональные графики S/R (charts.py)
+
 import os
 import time
 import asyncio
@@ -22,14 +27,18 @@ MAX_CONCURRENCY    = int(os.getenv("MAX_CONCURRENCY", "8"))
 COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", "900"))           # антиспам по символу (сек)
 STARTUP_PING       = os.getenv("STARTUP_PING", "true").lower() == "true"
 
-MIN_COIN_AGE_DAYS  = int(os.getenv("MIN_COIN_AGE_DAYS", "30"))       # не младше
+MIN_COIN_AGE_DAYS  = int(os.getenv("MIN_COIN_AGE_DAYS", "30"))       # не младше N дней
 BTC_FILTER         = os.getenv("BTC_FILTER", "off").lower()          # 'on'/'off'
-
 DISABLE_CHARTS     = os.getenv("DISABLE_CHARTS", "false").lower() == "true"
 
 HTTP_TOTAL_TIMEOUT = int(os.getenv("HTTP_TOTAL_TIMEOUT", "15"))
 TG_MAX_ATTEMPTS    = int(os.getenv("TG_MAX_ATTEMPTS", "5"))
 TG_BACKOFF_BASE    = float(os.getenv("TG_BACKOFF_BASE", "1.5"))
+
+# резервный универс (через ENV)
+FUTURES_SEED       = os.getenv("FUTURES_SEED", "")
+def _parse_seed(s: str) -> List[str]:
+    return [x.strip().upper() for x in s.replace(";", ",").split(",") if x.strip()]
 
 # ===================== HTTP endpoints & headers =====================
 MEXC_SPOT_API  = "https://api.mexc.com/api/v3"
@@ -42,7 +51,6 @@ HTTP_HEADERS: Dict[str, str] = {
 HAVE_CHARTS = False
 try:
     if not DISABLE_CHARTS:
-        # charts.py должен лежать рядом с проектом
         from charts import render_chart_image, klines_to_df, compute_sr_levels
         HAVE_CHARTS = True
 except Exception as e:
@@ -56,36 +64,28 @@ _symbols_backoff_until: float = 0.0  # когда можно снова пыта
 
 _last_sent: Dict[str, float] = {}    # антиспам по символу
 _last_sent_lock = asyncio.Lock()
-
 _sent_startup_ping = False
 
 # ===================== Telegram helpers (retries) =====================
 async def tg_call(bot, method: str, *args, **kwargs):
-    """
-    Надёжный вызов Telegram API с ретраями и экспоненциальным бэкоффом.
-    Возвращает результат или None.
-    """
     for attempt in range(1, TG_MAX_ATTEMPTS + 1):
         try:
             return await getattr(bot, method)(*args, **kwargs)
-
         except RetryAfter as e:
             delay = float(getattr(e, "retry_after", 1.0)) + 0.5
             await asyncio.sleep(delay)
-
         except (NetworkError, TimedOut) as e:
             if attempt == TG_MAX_ATTEMPTS:
                 log.warning("TG %s failed after %d tries: %s", method, attempt, e)
                 return None
             await asyncio.sleep(TG_BACKOFF_BASE ** attempt)
-
         except BadRequest as e:
             log.warning("TG BadRequest in %s: %s", method, e)
             return None
-
         except Exception as e:
             log.warning("TG error in %s: %r", method, e)
             return None
+    return None
 
 async def tg_send_message(bot, **kwargs):
     return await tg_call(bot, "send_message", **kwargs)
@@ -106,12 +106,13 @@ async def fetch_symbols() -> Tuple[List[str], bool]:
     Возвращает (symbols, refreshed_now).
     refreshed_now=True — только когда реально обновили кэш.
     Если API вернуло 0 — считаем сбоем, кэш не трогаем, уходим в бэкофф.
+    Если кэша нет — используем FUTURES_SEED как стартовый набор.
     """
     global _symbols_cache, _last_reload, _symbols_backoff_until
 
     now = time.time()
 
-    # уважаем бэкофф после неудачи, если кэш уже есть
+    # бэкофф: если была неудача, временно не дёргаем API (если кэш уже есть)
     if now < _symbols_backoff_until and _symbols_cache:
         return _symbols_cache, False
 
@@ -128,13 +129,19 @@ async def fetch_symbols() -> Tuple[List[str], bool]:
             if x.get("status") == "TRADING" and x.get("quoteAsset") == QUOTE:
                 syms.append(x["symbol"])
 
-        # если пусто — не обновляем кэш, ставим бэкофф
         if not syms:
-            _symbols_backoff_until = now + 300  # 5 минут
-            log.warning(
-                "fetch_symbols: API вернуло 0 символов; keep cache=%d, backoff 5m.",
-                len(_symbols_cache),
-            )
+            # если совсем пусто — и кэша нет — берём seed
+            if not _symbols_cache:
+                seed = _parse_seed(FUTURES_SEED)
+                if seed:
+                    _symbols_cache = seed[:]
+                    _last_reload = now
+                    _symbols_backoff_until = now + 300
+                    log.warning("fetch_symbols: API=0; using FUTURES_SEED=%d, backoff 5m.", len(seed))
+                    return _symbols_cache, True
+            # иначе просто бэкофф, кэш сохраняем
+            _symbols_backoff_until = now + 300
+            log.warning("fetch_symbols: API вернуло 0 символов; keep cache=%d, backoff 5m.", len(_symbols_cache))
             return _symbols_cache, False
 
         _symbols_cache = sorted(set(syms))
@@ -143,18 +150,22 @@ async def fetch_symbols() -> Tuple[List[str], bool]:
         return _symbols_cache, True
 
     except Exception as e:
-        # сеть/429 и т.п. — не трогаем кэш и уходим в бэкофф
         _symbols_backoff_until = now + 300
-        log.warning(
-            "fetch_symbols failed: %s; keep cache=%d, backoff 5m.",
-            e, len(_symbols_cache),
-        )
+        log.warning("fetch_symbols failed: %s; keep cache=%d, backoff 5m.", e, len(_symbols_cache))
+        # если кэша нет — попробуем seed
+        if not _symbols_cache:
+            seed = _parse_seed(FUTURES_SEED)
+            if seed:
+                _symbols_cache = seed[:]
+                _last_reload = now
+                return _symbols_cache, True
         return _symbols_cache, False
 
 async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int):
-    # формат: /klines?symbol=BTCUSDT&interval=1m&limit=30
-    return await _fetch_json(session, f"{MEXC_SPOT_API}/klines",
-                             symbol=symbol, interval=interval, limit=str(limit))
+    return await _fetch_json(
+        session, f"{MEXC_SPOT_API}/klines",
+        symbol=symbol, interval=interval, limit=str(limit)
+    )
 
 # ===================== Indicators =====================
 def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
@@ -163,10 +174,8 @@ def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     gains = losses = 0.0
     for i in range(1, period + 1):
         d = closes[i] - closes[i - 1]
-        if d >= 0:
-            gains += d
-        else:
-            losses += -d
+        if d >= 0: gains += d
+        else:      losses += -d
     avg_gain = gains / period
     avg_loss = losses / period
     for i in range(period + 1, len(closes)):
@@ -182,7 +191,7 @@ def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
 
 # ===================== Filters =====================
 async def btc_ok(session: aiohttp.ClientSession) -> bool:
-    """Если включён BTC_FILTER=on, не шортим, когда BTC в явном трендовом росте."""
+    """Если включён BTC_FILTER=on, избегаем шортов на бычьем импульсе BTC."""
     if BTC_FILTER != "on":
         return True
     try:
@@ -193,7 +202,6 @@ async def btc_ok(session: aiohttp.ClientSession) -> bool:
         sma = sum(closes[-20:]) / 20.0
         var = sum((c - sma) ** 2 for c in closes[-20:]) / 20.0
         std = var ** 0.5
-        # если цена сильно выше скользящей — пропускаем шорты
         return not (closes[-1] > sma + std)
     except Exception as e:
         log.warning("btc_ok failed (ignore): %s", e)
@@ -216,11 +224,7 @@ async def scanner_loop(bot, chat_id: int):
 
     if STARTUP_PING and not _sent_startup_ping:
         try:
-            await tg_send_message(
-                bot,
-                chat_id=chat_id,
-                text="🛰 Scanner online: MEXC 1m • RSI фильтр"
-            )
+            await tg_send_message(bot, chat_id=chat_id, text="🛰 Scanner online: MEXC 1m • RSI фильтр")
         except Exception:
             pass
         _sent_startup_ping = True
@@ -231,17 +235,14 @@ async def scanner_loop(bot, chat_id: int):
         try:
             symbols, refreshed = await fetch_symbols()
             if refreshed and symbols:
-                await tg_send_message(
-                    bot, chat_id=chat_id,
-                    text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
-                )
+                await tg_send_message(bot, chat_id=chat_id,
+                                      text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})")
 
             if not symbols:
                 await asyncio.sleep(10)
                 continue
 
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT)) as s:
-                # BTC фильтр
                 if not await btc_ok(s):
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
@@ -249,7 +250,6 @@ async def scanner_loop(bot, chat_id: int):
                 async def handle(sym: str):
                     async with sem:
                         try:
-                            # возраст монеты
                             if not await coin_age_ok(s, sym):
                                 return
 
@@ -268,21 +268,18 @@ async def scanner_loop(bot, chat_id: int):
                                 return
 
                             if change >= PUMP_THRESHOLD and rsi >= RSI_MIN:
-                                # --- антиспам по символу ---
+                                # антиспам
                                 now = time.time()
                                 async with _last_sent_lock:
                                     last = _last_sent.get(sym, 0.0)
                                     if now - last < COOLDOWN_SEC:
                                         return
                                     _last_sent[sym] = now
-                                # ----------------------------
 
                                 pct = round(change * 100, 2)
-
                                 mexc_url = f"https://www.mexc.com/exchange/{sym.replace(QUOTE,'')}_{QUOTE}"
                                 tv_url   = f"https://www.tradingview.com/chart/?symbol=MEXC:{sym}"
 
-                                # Текст сигнала
                                 lines = [
                                     f"🚨 Аномальный памп: +{pct}% за 1 мин",
                                     f"📉 Монета: {sym}",
@@ -303,7 +300,6 @@ async def scanner_loop(bot, chat_id: int):
                                     [InlineKeyboardButton("📈 TradingView", url=tv_url)],
                                 ])
 
-                                # Рендер графика (если доступен charts.py)
                                 img = None
                                 if HAVE_CHARTS:
                                     try:
@@ -311,33 +307,21 @@ async def scanner_loop(bot, chat_id: int):
                                         sr = compute_sr_levels(df)
                                         img = render_chart_image(
                                             symbol=sym, df=df, sr_levels=sr,
-                                            title=f"{sym} • 1m • S/R levels"
+                                            title=f"{sym} • 1m • S/R levels",
                                         )
                                     except Exception as e:
                                         log.warning("chart render failed for %s: %s", sym, e)
-                                        img = None
 
                                 if img is not None:
-                                    await tg_send_photo(
-                                        bot,
-                                        chat_id=chat_id,
-                                        photo=img,
-                                        caption=text,
-                                        parse_mode=ParseMode.HTML,
-                                        reply_markup=kb,
-                                    )
+                                    await tg_send_photo(bot, chat_id=chat_id, photo=img,
+                                                        caption=text, parse_mode=ParseMode.HTML,
+                                                        reply_markup=kb)
                                 else:
-                                    await tg_send_message(
-                                        bot,
-                                        chat_id=chat_id,
-                                        text=text,
-                                        parse_mode=ParseMode.HTML,
-                                        reply_markup=kb,
-                                        disable_web_page_preview=True,
-                                    )
-
+                                    await tg_send_message(bot, chat_id=chat_id, text=text,
+                                                          parse_mode=ParseMode.HTML,
+                                                          reply_markup=kb,
+                                                          disable_web_page_preview=True)
                         except Exception as e:
-                            # локальная ошибка символа — не рушим проход
                             log.debug("worker error %s: %s", sym, e)
 
                 tasks = [asyncio.create_task(handle(sym)) for sym in symbols]
