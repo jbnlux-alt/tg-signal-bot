@@ -1,5 +1,5 @@
 # scanner.py — FUTURES ONLY (MEXC USDT-PERPS)
-import os, asyncio, aiohttp, time, logging, json
+import os, asyncio, aiohttp, time, logging, json, random
 from typing import List, Optional
 from telegram.constants import ParseMode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -46,13 +46,23 @@ DCA2_BPS           = float(os.getenv("DCA2_BPS","1500"))           # -15%
 REQUIRE_VIP_STATS  = os.getenv("REQUIRE_VIP_STATS","false").lower()=="true"
 STATS_FILE         = os.getenv("STATS_FILE","stats.json")
 
+# Семена и файл кэша универса
+FUTURES_SEED       = [s.strip().upper() for s in os.getenv("FUTURES_SEED","").split(",") if s.strip()]
+SYMBOLS_CACHE_FILE = os.getenv("SYMBOLS_CACHE_FILE","futures_usdt_cache.json")
+
 # ---------- API ----------
 SPOT_API      = "https://api.mexc.com/api/v3"
 CONTRACT_API  = "https://contract.mexc.com/api/v1/contract"
 QUOTE         = "USDT"  # для ссылок/маппинга
 
 HTTP_TIMEOUT  = aiohttp.ClientTimeout(total=15)
-HEADERS       = {"User-Agent":"TradeSignalFilterBot/2.0 (+render)", "Accept":"application/json"}
+HEADERS       = {
+    "User-Agent": "Mozilla/5.0 (compatible; TradeSignalFilterBot/2.1; +render)",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.mexc.com",
+    "Referer": "https://www.mexc.com",
+}
 
 # ---------- КЭШ / СОСТОЯНИЕ ----------
 _last_sent: dict[str, float] = {}
@@ -97,54 +107,122 @@ def mexc_futures_url(sym: str) -> str:
 def tv_url(sym: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol=MEXC:{sym}"
 
-# ---------- СТАБИЛЬНЫЙ УНИВЕРС ПЕРПЕТУАЛОВ ----------
+def _load_cached_syms() -> List[str]:
+    try:
+        with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [str(x).upper() for x in data if isinstance(x, str)]
+    except Exception:
+        return []
+
+def _save_cached_syms(syms: List[str]) -> None:
+    try:
+        with open(SYMBOLS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(set(syms)), f, ensure_ascii=False)
+    except Exception:
+        pass
+
+# ---------- СТАБИЛЬНЫЙ УНИВЕРС ПЕРПЕТУАЛОВ С КЭШЕМ/ФОЛЛБЭКАМИ ----------
 async def fetch_futures_symbols() -> tuple[List[str], bool]:
     """
     Возвращает список SPOT-тикеров (BTCUSDT и т.п.), у которых есть USDT-perp.
-    Берём напрямую из /api/v1/contract/detail без параметра symbol.
+    Стратегия:
+      1) /contract/detail (без symbol) — основной источник
+      2) если пусто/403 — фоллбэк: кандидаты со спота + проверка наличия контракта
+      3) если опять пусто — берём кэш с диска и/или семена из ENV
+    Кэш не затираем при неуспехе. Обновляем раз в SYMBOL_REFRESH_SEC.
     """
     global _fut_syms, _last_refresh, _next_fetch_at
     now = time.time()
 
-    # кэширование
+    # уважение кэш-TTL
     if _fut_syms and (now - _last_refresh) < SYMBOL_REFRESH_SEC:
         return _fut_syms, False
 
+    # базовая «подстраховка» перед обновлением
+    if not _fut_syms:
+        disk = _load_cached_syms()
+        if disk:
+            _fut_syms = disk
+        elif FUTURES_SEED:
+            _fut_syms = FUTURES_SEED[:]
+
+    new_list: List[str] = []
+
+    # 1) основной источник — detail (может давать 403/пусто)
     try:
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as s:
             j = await _get_json(s, f"{CONTRACT_API}/detail")
             data = j.get("data") or []
-            fut: List[str] = []
             for it in data:
-                if not isinstance(it, dict):
-                    continue
-                # только активные USDT-M и доступные по API
-                if str(it.get("state")) != "0":
-                    continue
-                if (it.get("quoteCoin") != "USDT") or (it.get("settleCoin") != "USDT"):
-                    continue
-                if it.get("apiAllowed") is False:
-                    continue
+                if not isinstance(it, dict): continue
+                if str(it.get("state")) != "0": continue
+                if (it.get("quoteCoin") != "USDT") or (it.get("settleCoin") != "USDT"): continue
+                if it.get("apiAllowed") is False: continue
                 base = str(it.get("baseCoin", "")).upper()
-                if not base:
-                    continue
-                fut.append(f"{base}USDT")
-
-            fut = sorted(set(fut))
-            if fut:
-                _fut_syms = fut
-                _last_refresh = now
-                _next_fetch_at = now + SYMBOL_REFRESH_SEC
-                log.info("Futures universe updated (via /contract/detail): %d USDT perps", len(_fut_syms))
-                return _fut_syms, True
-            else:
-                _next_fetch_at = now + 300
-                log.warning("contract/detail returned 0 USDT perps; backoff 5m.")
-                return _fut_syms, False
+                if base: new_list.append(f"{base}USDT")
     except Exception as e:
-        _next_fetch_at = now + 300
-        log.warning("fetch_futures_symbols via /detail failed: %s (backoff 5m).", e)
+        log.warning("contract/detail primary failed: %s", e)
+
+    # 2) фоллбэк — спот кандидаты + проверка контракта
+    if not new_list:
+        try:
+            async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as s:
+                info = await _get_json(s, f"{SPOT_API}/exchangeInfo")
+                raw = info.get("symbols") or []
+                cand = [x["symbol"] for x in raw if x.get("status")=="TRADING" and x.get("quoteAsset")=="USDT"]
+                bad = ("3L","3S","4L","4S","5L","5S","UP","DOWN")
+                def ok(sym: str) -> bool:
+                    base = sym[:-4] if sym.endswith("USDT") else sym
+                    return not any(base.endswith(suf) for suf in bad)
+                cand = [c for c in cand if ok(c)]
+
+                sem = asyncio.Semaphore(12)
+                tmp: List[str] = []
+                async def check(sym: str):
+                    async with sem:
+                        c = spot_to_contract(sym)
+                        eps = [("detail", {"symbol": c}), ("ticker", {"symbol": c}), ("indexPrice", {"symbol": c})]
+                        for ep, params in eps:
+                            try:
+                                j2 = await _get_json(s, f"{CONTRACT_API}/{ep}", **params)
+                                if isinstance(j2, dict) and j2.get("data") not in (None, []):
+                                    tmp.append(sym); return
+                            except Exception:
+                                continue
+                await asyncio.gather(*(check(x) for x in cand))
+                new_list = sorted(set(tmp))
+        except Exception as e:
+            log.warning("fallback spot->contract failed: %s", e)
+
+    # 3) если снова пусто — не обнуляем, держим кэш/семена
+    if not new_list:
+        if _fut_syms:
+            _next_fetch_at = now + 300 + random.randint(0,60)
+            log.warning("No futures from APIs; keep cache=%d. Backoff 5m.", len(_fut_syms))
+            return _fut_syms, False
+        disk = _load_cached_syms()
+        if disk:
+            _fut_syms = disk
+            _next_fetch_at = now + 300 + random.randint(0,60)
+            log.warning("APIs empty; loaded %d symbols from disk cache. Backoff 5m.", len(_fut_syms))
+            return _fut_syms, False
+        if FUTURES_SEED:
+            _fut_syms = FUTURES_SEED[:]
+            _next_fetch_at = now + 300 + random.randint(0,60)
+            log.warning("APIs empty; using FUTURES_SEED=%d symbols. Backoff 5m.", len(_fut_syms))
+            return _fut_syms, False
+        _next_fetch_at = now + 300 + random.randint(0,60)
+        log.warning("APIs empty; no cache or seeds. Backoff 5m.")
         return _fut_syms, False
+
+    # успех — применяем и сохраняем
+    _fut_syms = sorted(set(new_list))
+    _last_refresh = now
+    _next_fetch_at = now + SYMBOL_REFRESH_SEC
+    _save_cached_syms(_fut_syms)
+    log.info("Futures universe refreshed: %d symbols.", len(_fut_syms))
+    return _fut_syms, True
 
 # ---------- ДАННЫЕ / ИНДИКАТОРЫ ----------
 async def spot_klines_1m(session: aiohttp.ClientSession, sym: str, limit: int = 180):
@@ -355,7 +433,7 @@ async def scanner_loop(bot, chat_id: int):
             if not syms:
                 await asyncio.sleep(10); continue
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as session:
 
                 # BTC фильтр (общий) — быстрый выход
                 if not await btc_ok(session):
