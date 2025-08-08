@@ -51,6 +51,8 @@ except Exception as e:
 # ===================== In-memory state =====================
 _symbols_cache: List[str] = []
 _last_reload: float = 0.0
+_symbols_backoff_until: float = 0.0  # когда можно снова дергать /exchangeInfo
+
 
 _last_sent: dict[str, float] = {}            # антиспам по символу
 _last_sent_lock = asyncio.Lock()
@@ -99,33 +101,56 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, **params):
         return await r.json()
 
 # ===================== Data fetchers =====================
-async def fetch_symbols() -> Tuple[List[str], bool]:
+async def fetch_symbols() -> tuple[list[str], bool]:
     """
     Возвращает (symbols, refreshed_now).
-    refreshed_now=True — если прямо сейчас обновили кэш.
-    Источник — MEXC spot /exchangeInfo (у фьючерсных перпов тикеры совпадают).
+    refreshed_now=True — только когда реально обновили кэш.
+    Если API вернуло 0 — считаем сбоем, кэш не трогаем, уходим в бэкофф.
     """
-    global _symbols_cache, _last_reload
+    global _symbols_cache, _last_reload, _symbols_backoff_until
+
     now = time.time()
+
+    # уважаем бэкофф после неудачи, если кэш уже есть
+    if now < _symbols_backoff_until and _symbols_cache:
+        return _symbols_cache, False
+
+    # не чаще чем раз в SYMBOL_REFRESH_SEC
     if _symbols_cache and (now - _last_reload) < SYMBOL_REFRESH_SEC:
         return _symbols_cache, False
 
     try:
         async with aiohttp.ClientSession() as s:
             info = await _fetch_json(s, f"{MEXC_SPOT_API}/exchangeInfo")
-        syms: List[str] = []
+
+        syms: list[str] = []
         for x in info.get("symbols", []):
             if x.get("status") == "TRADING" and x.get("quoteAsset") == QUOTE:
-                base = x.get("baseAsset", "")
-                # можно выкинуть левередж-токены, если надо:
-                # if base.endswith(("3L","3S","4L","4S","UP","DOWN")): continue
                 syms.append(x["symbol"])
+
+        # если пусто — не обновляем кэш, ставим бэкофф
+        if not syms:
+            _symbols_backoff_until = now + 300  # 5 минут
+            logging.getLogger("scanner").warning(
+                "fetch_symbols: API вернуло 0 символов; keep cache=%d, backoff 5m.",
+                len(_symbols_cache),
+            )
+            return _symbols_cache, False
+
         _symbols_cache = sorted(set(syms))
         _last_reload = now
+        _symbols_backoff_until = 0.0
         return _symbols_cache, True
+
     except Exception as e:
-        log.warning("fetch_symbols failed: %s", e)
+        # сеть/429 и т.п. — не трогаем кэш и уходим в бэкофф
+        _symbols_backoff_until = now + 300
+        logging.getLogger("scanner").warning(
+            "fetch_symbols failed: %s; keep cache=%d, backoff 5m.",
+            e, len(_symbols_cache),
+        )
         return _symbols_cache, False
+
 
 async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int):
     # формат: /klines?symbol=BTCUSDT&interval=1m&limit=30
