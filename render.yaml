@@ -19,11 +19,10 @@ services:
     name: trade-signal-scanner
     env: python
     plan: free
-    numInstances: 1         # важно: один инстанс, чтобы не было дублей "started"
+    numInstances: 1
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python scanner_main.py"
     envVars:
-      # можно задать тут, либо через Dashboard (sync:false)
       - key: TOKEN
         sync: false
       - key: CHAT_ID
