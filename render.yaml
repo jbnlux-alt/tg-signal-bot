@@ -19,20 +19,7 @@ services:
       - key: PORT
         value: "10000"
 
-  - type: worker
-    name: telegram-bot-scanner
-    env: python
-    plan: free
-    buildCommand: "pip install -U pip wheel setuptools && pip install -r requirements.txt"
-    startCommand: "python worker.py"
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: TOKEN
-        sync: false
-      - key: CHAT_ID
-        sync: false
-      # — базовые настройки для теста сигналов —
+      # --- настройки сканера (раз уж он теперь внутри web) ---
       - key: UNIVERSE_REFRESH_MODE
         value: seed
       - key: SIGNAL_SOURCE
@@ -40,11 +27,12 @@ services:
       - key: REQUIRE_SPOT_USDT
         value: "true"
       - key: PUMP_THRESHOLD
-        value: "0.025"   # 2.5% на 1м — чтобы были сигналы
+        value: "0.025"
       - key: RSI_MIN
         value: "60"
       - key: COOLDOWN_SEC
         value: "120"
       - key: ENTRY_MODE
         value: break1m
-      # при желании: добавь свой FUTURES_SEED в Dashboard или сюда
+      - key: ALIASES
+        value: "MATICUSDT=POLUSDT;FTMUSDT=REMOVE"
