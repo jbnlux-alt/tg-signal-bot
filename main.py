@@ -1,4 +1,3 @@
-# main.py — только Telegram webhook, без сканера
 import os, logging
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
@@ -25,7 +24,6 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(MessageHandler(filters.ALL, swallow))
-
     log.info("Starting webhook on port %d; path=%s", PORT, WEBHOOK_PATH)
     app.run_webhook(
         listen="0.0.0.0", port=PORT, url_path=WEBHOOK_PATH,
