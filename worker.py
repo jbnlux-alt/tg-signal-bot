@@ -1,4 +1,3 @@
-# worker.py — отдельный процесс со сканером
 import os, asyncio, logging, signal
 from telegram import Bot
 from telegram.request import HTTPXRequest
@@ -13,11 +12,9 @@ async def main():
     if not token: raise RuntimeError("TOKEN is required")
     if not chat_id: raise RuntimeError("CHAT_ID is required")
 
-    # httpx таймауты, чтобы не падал на холодном старте
     req = HTTPXRequest(connect_timeout=10, read_timeout=30)
     bot = Bot(token=token, request=req)
 
-    # мягкий тест-коннекта (не обязателен)
     try:
         me = await bot.get_me()
         log.info("Bot online: @%s", me.username)
