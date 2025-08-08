@@ -328,11 +328,9 @@ async def fetch_futures_symbols() -> tuple[List[str], bool]:
 
 # ---------- ДАННЫЕ / ИНДИКАТОРЫ ----------
 async def spot_klines_1m(session: aiohttp.ClientSession, sym: str, limit: int = 180):
-    # контрактные свечи бывают нестабильны по API — используем спот-цены как прокси; если нет, берём перпы
     return await _klines_any(session, sym, "1m", limit)
 
 async def get_24h_contract(session: aiohttp.ClientSession, sym: str) -> tuple[Optional[float], Optional[float]]:
-    # 24h (перп): quoteVol + priceChangePercent
     c = spot_to_contract(sym)
     for ep in ("ticker", "detail"):
         try:
@@ -421,7 +419,6 @@ def _resample_every(vals: List[float], step: int) -> List[float]:
 
 # ---------- ФИЛЬТРЫ СТРАТЕГИИ ----------
 async def coin_age_ok(session: aiohttp.ClientSession, sym: str) -> bool:
-    # 1d; если 400 — 4h и считаем «дни» как 6 свечей 4h = 1d
     d1 = await _klines_any(session, sym, "1d", MIN_COIN_AGE_DAYS + 5)
     if isinstance(d1, list) and len(d1) >= MIN_COIN_AGE_DAYS:
         return True
@@ -455,7 +452,7 @@ async def daily_pump_risk(session: aiohttp.ClientSession, sym: str) -> bool:
     return any(abs((c[i]-c[i-1])/max(1e-12,c[i-1])) >= thr for i in range(1,len(c)))
 
 async def btc_ok(session: aiohttp.ClientSession) -> bool:
-    """BTC: 15m изменение ≤0.5% ИЛИ 60m наклон ≤0. Час на MEXC — '60m'."""
+    """BTC: 15m изменение ≤0.5% ИЛИ 60m наклон ≤0."""
     if not BTC_FILTER:
         return True
     try:
@@ -535,7 +532,6 @@ def fmt_stats(s: Optional[dict]) -> str:
 
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
 async def scanner_loop(bot, chat_id: int):
-    # приветствие
     await bot.send_message(chat_id=chat_id, text="🛰 Scanner online: MEXC Futures (USDT-perps) • RSI/SR")
     log.info("CFG: pump=%.2f%% rsi_min=%s scan=%ds R=%.2f entry=%s deposit=%.2f",
              PUMP_THRESHOLD*100, RSI_MIN, SCAN_INTERVAL, TAKE_PROFIT_R, ENTRY_MODE, DEPOSIT_USDT)
@@ -558,23 +554,19 @@ async def scanner_loop(bot, chat_id: int):
 
             async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as session:
 
-                # BTC фильтр (общий) — быстрый выход
                 if not await btc_ok(session):
                     await asyncio.sleep(SCAN_INTERVAL); continue
 
                 async def worker(sym_in: str):
                     async with sem:
                         try:
-                            # алиасы/делисты: на всякий случай нормализуем и тут
                             sym = _canon(sym_in) or sym_in
 
-                            # Возраст / тренд / риск дневных пампов / VIP
                             if not await coin_age_ok(session, sym): return
                             risk_pumps = await daily_pump_risk(session, sym)
                             if REQUIRE_MONTHLY_DOWNTREND and not await monthly_downtrend(session, sym): return
                             if REQUIRE_VIP_STATS and not vip_flag(stats_all, sym): return
 
-                            # 1m клины как прокси
                             m1 = await spot_klines_1m(session, sym, 180)
                             if not isinstance(m1, list) or len(m1) < 20: return
                             closes = [float(x[4]) for x in m1]
@@ -587,38 +579,32 @@ async def scanner_loop(bot, chat_id: int):
                             rsi = calc_rsi(closes, 14)
                             if rsi is None or change < PUMP_THRESHOLD or rsi < RSI_MIN: return
 
-                            # Уровни S/R → вход/стоп/тейк
                             df = klines_to_df(m1[-120:])
                             srl = compute_sr_levels(df, lookback=3, tolerance_ratio=0.002, max_levels=6)
                             entry, stop, take, label = pick_short_entry(highs, lows, closes, srl)
                             notional, qty, note = position_size(entry, stop)
 
-                            # Лимиты по открытым и марже
                             _prune_open(time.time())
                             future_margin_bps = _open_margin_bps() + 10000.0*notional/max(1e-9,DEPOSIT_USDT)
                             if _open_count_total() >= 3 or _open_count_symbol(sym) >= 2 or future_margin_bps > MARGIN_CAP_BPS:
                                 return
 
-                            # Анти-спам
                             async with _last_sent_lock:
                                 last = _last_sent.get(sym, 0.0)
                                 if time.time() - last < COOLDOWN_SEC: return
                                 _last_sent[sym] = time.time()
                             _open.append({"sym": sym, "ts": time.time(), "notional": notional})
 
-                            # Контрактная инфа
                             vol24, _ = await get_24h_contract(session, sym)
                             fund = await get_funding_rate(session, sym)
                             lev  = await get_max_leverage(session, sym)
 
                             fund_warn = (fund is not None and abs(fund) > (FUNDING_MAX_BPS/10000.0))
 
-                            # Безопасные строки для форматирования
                             lev_str  = f"x{lev}" if lev else "—"
                             vol_str  = f"~${round((vol24 or 0)/1e6, 2)}M" if vol24 else "—"
                             fund_str = f"{fund*100:.4f}%" if fund is not None else "n/a"
 
-                            # Рендер графика (с уровнями + ENTRY/STOP/TAKE + swing-high метки)
                             try:
                                 img = render_chart_image(sym, m1, levels=srl, entry=entry, stop=stop, take=take, mark_swings=True)
                             except Exception:
@@ -666,9 +652,11 @@ async def scanner_loop(bot, chat_id: int):
                         except Exception:
                             log.exception("worker error %s", sym_in)
 
-                await asyncio.gather(*(worker(s) for s in syms))
+            await asyncio.sleep(SCAN_INTERVAL)
 
+        except asyncio.CancelledError:
+            log.info("scanner_loop cancelled, shutting down gracefully")
+            break
         except Exception:
             log.exception("scanner_loop tick failed")
-
-        await asyncio.sleep(SCAN_INTERVAL)
+            await asyncio.sleep(SCAN_INTERVAL)
