@@ -3,6 +3,8 @@ import os, asyncio, aiohttp, time, logging
 from telegram.constants import ParseMode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from charts import render_chart_image  # <-- новый импорт
+
 # ---------- Логи ----------
 logging.basicConfig(
     level=logging.INFO,
@@ -41,30 +43,22 @@ _HTTP_HEADERS = {
 async def _fetch_json(session: aiohttp.ClientSession, url: str, **params):
     async with session.get(url, params=params, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15)) as r:
         r.raise_for_status()
-        return await r.json(content_type=None)  # иногда content-type ломают
+        return await r.json(content_type=None)
 
-# ---------- Загрузка всех USDT-пар MEXC (с бэк-оффом и фолбэками) ----------
+# ---------- Загрузка всех USDT-пар (с фолбэками) ----------
 async def fetch_symbols() -> tuple[list[str], bool]:
-    """
-    Возвращает (symbols, refreshed_now).
-    Бэк-офф работает даже при пустом кэше. Фолбэки: /exchangeInfo → /ticker/price → /open/api/v2/market/symbols.
-    refreshed_now=True — только если кэш реально обновился валидными данными.
-    """
     global _symbols_cache, _last_reload, _next_pairs_fetch_at
     now = time.time()
 
-    # соблюдаем окно, даже если кэш пуст
     if now < _next_pairs_fetch_at:
         return _symbols_cache, False
-
-    # если недавно обновляли — не трогаем
     if (now - _last_reload) < SYMBOL_REFRESH_SEC and _symbols_cache:
         return _symbols_cache, False
 
     symbols: list[str] = []
     try:
         async with aiohttp.ClientSession(headers=_HTTP_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as s:
-            # 1) Основной: /api/v3/exchangeInfo
+            # 1) exchangeInfo
             try:
                 info = await _fetch_json(s, f"{MEXC_API}/exchangeInfo")
                 raw = info.get("symbols") or []
@@ -76,13 +70,12 @@ async def fetch_symbols() -> tuple[list[str], bool]:
             except Exception as e:
                 log.warning("exchangeInfo failed: %s", e)
 
-            # 2) Фолбэк: /api/v3/ticker/price → фильтр по суффиксу QUOTE
+            # 2) /ticker/price
             if not symbols:
                 try:
                     prices = await _fetch_json(s, f"{MEXC_API}/ticker/price")
                     cand = [it["symbol"] for it in prices if isinstance(it, dict) and it.get("symbol", "").endswith(QUOTE)]
-                    # фильтр левередж-токенов по суффиксам
-                    bad_suffixes = ("3L", "3S", "4L", "4S", "5L", "5S", "UP", "DOWN")
+                    bad_suffixes = ("3L","3S","4L","4S","5L","5S","UP","DOWN")
                     def ok(sym: str) -> bool:
                         base = sym[: -len(QUOTE)] if sym.endswith(QUOTE) else sym
                         return not any(base.endswith(suf) for suf in bad_suffixes)
@@ -90,7 +83,7 @@ async def fetch_symbols() -> tuple[list[str], bool]:
                 except Exception as e:
                     log.warning("ticker/price fallback failed: %s", e)
 
-            # 3) Фолбэк: /open/api/v2/market/symbols (возвращает BTC_USDT → конвертируем в BTCUSDT)
+            # 3) /open/api/v2/market/symbols (BTC_USDT -> BTCUSDT)
             if not symbols:
                 try:
                     j = await _fetch_json(s, f"{OPEN_API}/market/symbols")
@@ -98,8 +91,8 @@ async def fetch_symbols() -> tuple[list[str], bool]:
                     conv = []
                     for it in data:
                         state = (it.get("state") or "").upper()
-                        if state in ("ENABLED", "ENALBED", "ONLINE"):  # видели опечатки в ответах
-                            sym = it.get("symbol", "")
+                        if state in ("ENABLED","ENALBED","ONLINE"):
+                            sym = it.get("symbol","")
                             if "_" in sym:
                                 base, quote = sym.split("_", 1)
                                 if quote == QUOTE:
@@ -119,41 +112,32 @@ async def fetch_symbols() -> tuple[list[str], bool]:
         log.info("Pairs updated: %d (QUOTE=%s)", len(_symbols_cache), QUOTE)
         return _symbols_cache, True
     else:
-        # пусто — кэш не трогаем, ждём 5 минут
         _next_pairs_fetch_at = now + 300
         log.warning("MEXC returned 0 symbols (all fallbacks). Keep cache=%d. Backoff 5m.", len(_symbols_cache))
         return _symbols_cache, False
 
-# ---------- Свечи 1m с MEXC ----------
-async def fetch_klines_1m(session: aiohttp.ClientSession, symbol: str, limit: int = 30):
-    # формат: /klines?symbol=BTCUSDT&interval=1m&limit=30
+# ---------- Свечи 1m c MEXC ----------
+async def fetch_klines_1m(session: aiohttp.ClientSession, symbol: str, limit: int = 150):
     return await _fetch_json(session, f"{MEXC_API}/klines", symbol=symbol, interval="1m", limit=str(limit))
 
 # ---------- RSI(14) ----------
 def calc_rsi(closes: list[float], period: int = 14) -> float | None:
     if len(closes) < period + 1:
         return None
-
-    # Wilder's RSI
     gains = losses = 0.0
     for i in range(1, period + 1):
         d = closes[i] - closes[i - 1]
-        if d >= 0:
-            gains += d
-        else:
-            losses += -d
+        if d >= 0: gains += d
+        else:      losses += -d
     avg_gain = gains / period
     avg_loss = losses / period
-
     for i in range(period + 1, len(closes)):
         d = closes[i] - closes[i - 1]
         gain = d if d > 0 else 0.0
         loss = -d if d < 0 else 0.0
         avg_gain = (avg_gain * (period - 1) + gain) / period
         avg_loss = (avg_loss * (period - 1) + loss) / period
-
-    if avg_loss == 0:
-        return 100.0
+    if avg_loss == 0: return 100.0
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -167,7 +151,6 @@ async def scanner_loop(bot, chat_id: int):
             log.exception("Startup ping failed")
         _sent_startup_ping = True
 
-    # лог конфигурации один раз при старте
     log.info(
         "CFG: pump=%.2f%% rsi_min=%s scan=%ds refresh=%ds quote=%s conc=%d cooldown=%ds",
         PUMP_THRESHOLD*100, RSI_MIN, SCAN_INTERVAL, SYMBOL_REFRESH_SEC, QUOTE, MAX_CONCURRENCY, COOLDOWN_SEC
@@ -180,15 +163,10 @@ async def scanner_loop(bot, chat_id: int):
     while True:
         try:
             symbols, refreshed = await fetch_symbols()
-
-            # уведомление об обновлении пар — только при реальном изменении и не чаще 1 раза в 10 минут
             now_ts = time.time()
             if refreshed and (last_pairs_count != len(symbols)) and (now_ts - last_pairs_announce_ts) > 600:
                 try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})"
-                    )
+                    await bot.send_message(chat_id=chat_id, text=f"🔄 Пары MEXC обновлены: {len(symbols)} (QUOTE={QUOTE})")
                     last_pairs_count = len(symbols)
                     last_pairs_announce_ts = now_ts
                 except Exception:
@@ -203,15 +181,13 @@ async def scanner_loop(bot, chat_id: int):
                 async def handle(sym: str):
                     async with sem:
                         try:
-                            data = await fetch_klines_1m(s, sym, limit=30)
-                            if not isinstance(data, list) or len(data) < 2:
+                            data = await fetch_klines_1m(s, sym, limit=180)  # побольше для красивого графика
+                            if not isinstance(data, list) or len(data) < 20:
                                 return
-
                             closes = [float(x[4]) for x in data]
                             prev_c, last_c = closes[-2], closes[-1]
                             if prev_c <= 0:
                                 return
-
                             change = (last_c - prev_c) / prev_c
                             rsi = calc_rsi(closes, period=14)
                             if rsi is None:
@@ -227,11 +203,18 @@ async def scanner_loop(bot, chat_id: int):
                                     _last_sent[sym] = now_local
                                 # --- конец анти-спама ---
 
+                                # Рендер графика с уровнями
+                                try:
+                                    img = render_chart_image(sym, data)  # BytesIO PNG
+                                except Exception:
+                                    log.exception("chart render failed %s", sym)
+                                    img = None
+
                                 pct = round(change * 100, 2)
                                 mexc_url = f"https://www.mexc.com/exchange/{sym.replace(QUOTE,'')}_{QUOTE}"
                                 tv_url   = f"https://www.tradingview.com/chart/?symbol=MEXC:{sym}"
 
-                                text = (
+                                caption = (
                                     f"🚨 Аномальный памп: +{pct}% за 1 мин\n"
                                     f"📉 Монета: {sym}\n"
                                     f"💵 Цена: {last_c}\n\n"
@@ -245,16 +228,25 @@ async def scanner_loop(bot, chat_id: int):
 
                                 kb = InlineKeyboardMarkup([
                                     [InlineKeyboardButton("🔘 Открыть сделку на MEXC", url=mexc_url)],
-                                    [InlineKeyboardButton("📈 Смотреть график (TradingView)", url=tv_url)],
+                                    [InlineKeyboardButton("📈 TradingView", url=tv_url)],
                                 ])
 
-                                await bot.send_message(
-                                    chat_id=chat_id,
-                                    text=text,
-                                    reply_markup=kb,
-                                    parse_mode=ParseMode.HTML,
-                                    disable_web_page_preview=True
-                                )
+                                if img:
+                                    await bot.send_photo(
+                                        chat_id=chat_id,
+                                        photo=img,
+                                        caption=caption,
+                                        reply_markup=kb,
+                                        parse_mode=ParseMode.HTML
+                                    )
+                                else:
+                                    await bot.send_message(
+                                        chat_id=chat_id,
+                                        text=caption + f"\n🔗 MEXC: {mexc_url}\n📈 TV: {tv_url}",
+                                        reply_markup=kb,
+                                        parse_mode=ParseMode.HTML,
+                                        disable_web_page_preview=True
+                                    )
                         except Exception:
                             log.exception("scan error %s", sym)
                             return
