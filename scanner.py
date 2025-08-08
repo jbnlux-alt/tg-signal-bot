@@ -1,139 +1,115 @@
-import os, asyncio, time, re
-import httpx
+import os
+import time
+import requests
+from datetime import datetime
 
-API_BASE = os.environ.get("MEXC_API_BASE", "https://api.mexc.com")
-PUMP_THRESHOLD = float(os.environ.get("PUMP_THRESHOLD", "0.70"))  # 0.70 = 70%
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "10"))        # сек между циклами
-RSI_MIN = float(os.environ.get("RSI_MIN", "70"))
-QUOTE = os.environ.get("QUOTE_FILTER", "USDT")                    # котировка
-SYMBOL_REFRESH_SEC = int(os.environ.get("SYMBOL_REFRESH_SEC", "600"))  # раз в 10 мин
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "8"))     # одновременно запросов
-INCLUDE_LEVERAGED = os.environ.get("INCLUDE_LEVERAGED", "false").lower() == "true"
+# --- Константы и настройки ---
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+QUOTE = "USDT"  # торгуемая пара к USDT
+PUMP_THRESHOLD = 0.01  # 1% за минуту
+RSI_MIN = 70  # минимальный RSI для сигнала
+SYMBOL_REFRESH_SEC = int(os.getenv("SYMBOL_REFRESH_SEC", 86400))  # обновление списка пар раз в день
 
-KLINES_URL = f"{API_BASE}/api/v3/klines"
-EXCHANGE_INFO_URL = f"{API_BASE}/api/v3/exchangeInfo"
+# --- Глобальный список символов ---
+symbols = []
+last_refresh = 0
 
-_leveraged_pat = re.compile(r"(?:[234]L|[234]S|UP|DOWN)$", re.IGNORECASE)
+# --- Функция отправки в Telegram ---
+def send_signal(msg):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[ERROR] Не удалось отправить сообщение: {e}")
 
-async def fetch_exchange_info():
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(EXCHANGE_INFO_URL)
-        r.raise_for_status()
-        return r.json()
+# --- Получаем список торговых пар ---
+def fetch_symbols():
+    url = "https://api.binance.com/api/v3/exchangeInfo"
+    try:
+        resp = requests.get(url, timeout=10).json()
+        pairs = [s["symbol"] for s in resp["symbols"] if s["symbol"].endswith(QUOTE)]
+        print(f"[INFO] Загружено {len(pairs)} пар")
+        return pairs
+    except Exception as e:
+        print(f"[ERROR] Ошибка загрузки списка пар: {e}")
+        return []
 
-def want_symbol(sym_obj):
-    # sym_obj формат MEXC: { "symbol": "BTCUSDT", "status":"TRADING", "baseAsset":"BTC", "quoteAsset":"USDT", ... }
-    if sym_obj.get("status") != "TRADING":
-        return False
-    if sym_obj.get("quoteAsset") != QUOTE:
-        return False
-    sym = sym_obj.get("symbol","")
-    if not INCLUDE_LEVERAGED and _leveraged_pat.search(sym.replace(QUOTE,"")):
-        return False
-    return True
-
-async def get_all_symbols():
-    info = await fetch_exchange_info()
-    # MEXC иногда возвращает "symbols": [...]
-    symbols = []
-    for s in info.get("symbols", []):
-        if want_symbol(s):
-            symbols.append(s["symbol"])
-    return sorted(set(symbols))
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
+# --- Получаем последние свечи и считаем RSI ---
+def get_rsi(symbol, interval="1m", period=14):
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={period+1}"
+        klines = requests.get(url, timeout=10).json()
+        closes = [float(k[4]) for k in klines]
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            if diff >= 0:
+                gains.append(diff)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(diff))
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    except Exception as e:
+        print(f"[ERROR] RSI {symbol}: {e}")
         return None
-    gains = losses = 0.0
-    for i in range(1, period + 1):
-        delta = values[-i] - values[-i-1]
-        if delta >= 0:
-            gains += delta
-        else:
-            losses += -delta
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
 
-async def fetch_klines(client, symbol: str, limit: int = 100):
-    params = {"symbol": symbol, "interval": "1m", "limit": str(limit)}
-    r = await client.get(KLINES_URL, params=params)
-    r.raise_for_status()
-    return r.json()
+# --- Проверяем сигналы ---
+def check_signal(sym):
+    try:
+        # Цена сейчас и минуту назад
+        url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=1m&limit=2"
+        klines = requests.get(url, timeout=10).json()
+        price_old = float(klines[0][4])
+        price_new = float(klines[1][4])
+        change = (price_new - price_old) / price_old
 
-async def check_symbol(client, symbol: str):
-    # Для экономии трафика хватит 30 свечей (RSI14 + 1m изменение)
-    data = await fetch_klines(client, symbol, limit=30)
-    closes = [float(x[4]) for x in data]
-    last_close, prev_close = closes[-1], closes[-2]
-    change = (last_close - prev_close) / prev_close
-    r = rsi(closes, period=14)
-    return symbol, change, r, last_close
+        rsi_val = get_rsi(sym)
 
-async def scanner_loop(bot, chat_id: int):
-    symbols = []
-    last_reload = 0.0
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        if change >= PUMP_THRESHOLD and (rsi_val is not None and rsi_val >= RSI_MIN):
+            pct = round(change * 100, 2)
+            rsi_txt = f"{rsi_val:.2f}"
+            mexc_url = f"https://www.mexc.com/exchange/{sym.replace(QUOTE,'')}_{QUOTE}"
+            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
+            msg = (
+                f"🚨 Аномальный памп: +{pct}% за 1 мин\n"
+                f"📉 Монета: ${sym}\n"
+                f"💵 Цена: {price_new}\n\n"
+                f"📊 Условия:\n"
+                f"✅ RSI: {rsi_txt} (мин {int(RSI_MIN)})\n"
+                f"✅ Порог пампа: {int(PUMP_THRESHOLD*100)}%\n"
+                f"🕒 Таймфрейм: 1m\n\n"
+                f"🎯 SHORT (MVP)\n"
+                f"💰 Риск: 0.1% | Тейк: 250%\n\n"
+                f"📈 <a href='{tv_url}'>TradingView</a> | <a href='{mexc_url}'>MEXC</a>"
+            )
+            send_signal(msg)
+    except Exception as e:
+        print(f"[ERROR] Сигнал {sym}: {e}")
 
-    async def _task(sym, client):
-        async with sem:
-            try:
-                return await check_symbol(client, sym)
-            except Exception:
-                return None
-
+# --- Основной цикл ---
+def scanner_loop():
+    global symbols, last_refresh
     while True:
         now = time.time()
-        try:
-            # периодически обновляем список символов
-            if not symbols or (now - last_reload) >= SYMBOL_REFRESH_SEC:
-                try:
-                    symbols = await get_all_symbols()
-                    last_reload = now
-                except Exception:
-                    # если не удалось — оставляем предыдущий список
-                    pass
+        # Обновление списка пар
+        if now - last_refresh > SYMBOL_REFRESH_SEC or not symbols:
+            symbols = fetch_symbols()
+            last_refresh = now
 
-            if not symbols:
-                await asyncio.sleep(5)
-                continue
+        for sym in symbols:
+            check_signal(sym)
 
-            async with httpx.AsyncClient(timeout=10) as client:
-                tasks = [_task(sym, client) for sym in symbols]
-                for coro in asyncio.as_completed(tasks):
-                    res = await coro
-                    if not res:
-                        continue
-                    sym, change, rsi_val, price = res
-                    if change >= PUMP_THRESHOLD and (rsi_val is not None and rsi_val >= RSI_MIN):
-                        pct = round(change * 100, 2)
-                        rsi_txt = f"{rsi_val:.2f}"
-                        mexc_url = f"https://www.mexc.com/exchange/{sym.replace(QUOTE,'')}_{QUOTE}"
-                        tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
-                        msg = (
-                            f"🚨 Аномальный памп: +{pct}% за 1 мин\n"
-                            f"📉 Монета: ${sym}\n"
-                            f"💵 Цена: {price}\n\n"
-                            f"📊 Условия:\n"
-                            f"✅ RSI: {rsi_txt} (мин {int(RSI_MIN)})\n"
-                            f"✅ Порог пампа: {int(PUMP_THRESHOLD*100)}%\n"
-                            f"🕒 Таймфрейм: 1m\n\n"
-                            f"🎯 SHORT (MVP)\n"
-                            f"💰 Риск: 0.1% | Тейк: 250%\n"
-                        )
-                        reply_markup = {
-                            "inline_keyboard": [
-                                [{"text": "🔘 Открыть сделку на MEXC", "url": mexc_url}],
-                                [{"text": "📈 График (TradingView)", "url": tv_url}],
-                            ]
-                        }
-                        await bot.send_message(chat_id=chat_id, text=msg, reply_markup=reply_markup)
+        time.sleep(2)  # задержка между запросами к разным монетам
 
-        except Exception:
-            # не падаем, продолжаем цикл
-            pass
+if __name__ == "__main__":
+    print("[INFO] Запуск сканера...")
+    scanner_loop()
 
-        await asyncio.sleep(SCAN_INTERVAL)
