@@ -297,17 +297,27 @@ async def daily_pump_risk(session: aiohttp.ClientSession, sym: str) -> bool:
     return any(abs((c[i]-c[i-1])/max(1e-12,c[i-1])) >= thr for i in range(1,len(c)))
 
 async def btc_ok(session: aiohttp.ClientSession) -> bool:
-    if not BTC_FILTER: return True
-    m5 = await _get_json(session, f"{SPOT_API}/klines", symbol="BTCUSDT", interval="5m", limit="24")
-    if not isinstance(m5, list) or len(m5) < 4: return True
-    c5 = [float(x[4]) for x in m5]
-    chg15 = (c5[-1]-c5[-4]) / c5[-4]
-    h1 = await _get_json(session, f"{SPOT_API}/klines", symbol="BTCUSDT", interval="1h", limit="30")
-    slope1h = 0.0
-    if isinstance(h1, list) and len(h1) >= 10:
-        c1h = [float(x[4]) for x in h1][-20:]
-        slope1h = _slope(c1h)
-    return (abs(chg15) <= 0.005) or (slope1h <= 0)
+    """BTC в коррекции/флэте: 15m изменение ≤0.5% ИЛИ 60m наклон ≤0.
+    На MEXC часовой интервал — '60m'."""
+    if not BTC_FILTER:
+        return True
+    try:
+        m5 = await _get_json(session, f"{SPOT_API}/klines", symbol="BTCUSDT", interval="5m", limit="24")
+        if not isinstance(m5, list) or len(m5) < 4:
+            return True
+        c5 = [float(x[4]) for x in m5]
+        chg15 = (c5[-1] - c5[-4]) / c5[-4]
+    except Exception:
+        return True
+    slope60 = 0.0
+    try:
+        h1 = await _get_json(session, f"{SPOT_API}/klines", symbol="BTCUSDT", interval="60m", limit="30")
+        if isinstance(h1, list) and len(h1) >= 10:
+            c60 = [float(x[4]) for x in h1][-20:]
+            slope60 = _slope(c60)
+    except Exception:
+        pass
+    return (abs(chg15) <= 0.005) or (slope60 <= 0)
 
 # Entry/Stop/Take (SHORT)
 def pick_short_entry(high: List[float], low: List[float], close: List[float], levels: List[float]) -> tuple[float,float,float,str]:
@@ -438,7 +448,7 @@ async def scanner_loop(bot, chat_id: int):
                             _open.append({"sym": sym, "ts": time.time(), "notional": notional})
 
                             # Контрактная инфа
-                            vol24, pch24 = await get_24h_contract(session, sym)
+                            vol24, _ = await get_24h_contract(session, sym)
                             fund = await get_funding_rate(session, sym)
                             lev  = await get_max_leverage(session, sym)
 
