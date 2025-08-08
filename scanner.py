@@ -314,9 +314,11 @@ def pick_short_entry(high: List[float], low: List[float], close: List[float], le
     last_c = close[-1]; prev_low = low[-2]; prev_high = high[-2]
     off = ENTRY_OFFSET_BPS/10000.0; buf = STOP_BUFFER_BPS/10000.0
     label = "PLAN"
-    if os.getenv("ENTRY_MODE","retest_sr") == "break1m":
-        if last_c < prev_low: entry = last_c; label="NOW"
-        else: entry = prev_low*(1-off)
+    if ENTRY_MODE == "break1m":
+        if last_c < prev_low:
+            entry = last_c; label="NOW"
+        else:
+            entry = prev_low*(1-off)
     else:
         above = [lv for lv in levels if lv >= last_c]
         entry = (min(above) if above else prev_high)*(1-off)
@@ -400,9 +402,7 @@ async def scanner_loop(bot, chat_id: int):
                             # Возраст / тренд / риск дневных пампов / VIP
                             if not await coin_age_ok(session, sym): return
                             risk_pumps = await daily_pump_risk(session, sym)
-                            if REQUIRE_MONTHLY_DOWN
-
-trend and not await monthly_downtrend(session, sym): return
+                            if REQUIRE_MONTHLY_DOWNTREND and not await monthly_downtrend(session, sym): return
                             if REQUIRE_VIP_STATS and not vip_flag(stats_all, sym): return
 
                             # 1m спот-свечи как прокси
