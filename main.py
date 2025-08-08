@@ -1,7 +1,5 @@
-# main.py — универсальный запуск: polling (c health-сервером) или webhook.
-# Для быстрой починки ставь USE_POLLING=true (рекомендовано на free-плане).
-
-import os, logging, asyncio
+# main.py — универсальный запуск: polling (с health-сервером) или webhook
+import os, logging, asyncio, signal
 from contextlib import suppress
 from aiohttp import web
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -57,23 +55,42 @@ async def run_polling_mode():
     log.info("Starting in POLLING mode (health server on :%d)", PORT)
     runner = await start_health_server()
 
-    tg = build_app()
-    await tg.initialize()
-    await tg.start()
+    app = build_app()
+    await app.initialize()
+    await app.start()
 
-    # запускаем сканер
-    scanner_task = tg.create_task(scanner_loop(tg.bot, CHAT_ID))
+    # стартуем сканер
+    scanner_task = app.create_task(scanner_loop(app.bot, CHAT_ID))
+
     # запускаем polling
-    await tg.updater.start_polling(drop_pending_updates=True, allowed_updates=["message","callback_query","my_chat_member"])
+    await app.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message","callback_query","my_chat_member"]
+    )
+
+    # ждём сигнал завершения
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
     try:
-        await tg.updater.wait_until_closed()
+        await stop_event.wait()
     finally:
+        # корректная остановка: сначала polling, потом app
+        stop_coro = app.updater.stop()
+        if asyncio.iscoroutine(stop_coro):
+            await stop_coro
+
         scanner_task.cancel()
         with suppress(asyncio.CancelledError):
             await scanner_task
-        await tg.stop()
-        await tg.shutdown()
-        # гасим health
+
+        await app.stop()
+        await app.shutdown()
         await runner.cleanup()
 
 async def run_webhook_mode():
@@ -83,38 +100,38 @@ async def run_webhook_mode():
     url  = WEBHOOK_BASE.rstrip("/") + path
     log.info("Starting in WEBHOOK mode :%d url=%s", PORT, url)
 
-    tg = build_app()
+    app = build_app()
 
-    async def post_init(app: Application):
+    async def post_init(a: Application):
         try:
-            info = await app.bot.get_webhook_info()
+            info = await a.bot.get_webhook_info()
             log.info("Webhook BEFORE set: %s", info.to_dict())
-            await app.bot.set_webhook(
+            await a.bot.set_webhook(
                 url=url,
                 allowed_updates=["message","callback_query","my_chat_member"],
                 drop_pending_updates=True,
             )
-            info = await app.bot.get_webhook_info()
+            info = await a.bot.get_webhook_info()
             log.info("Webhook AFTER set: %s", info.to_dict())
         except TelegramError as e:
             log.error("set_webhook failed: %s", e)
 
-        task = app.create_task(scanner_loop(app.bot, CHAT_ID))
-        app.bot_data["scanner_task"] = task
+        task = a.create_task(scanner_loop(a.bot, CHAT_ID))
+        a.bot_data["scanner_task"] = task
         log.info("scanner_task started")
 
-    async def post_shutdown(app: Application):
-        task = app.bot_data.get("scanner_task")
+    async def post_shutdown(a: Application):
+        task = a.bot_data.get("scanner_task")
         if task:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
             log.info("scanner_task cancelled")
 
-    tg.post_init = post_init
-    tg.post_shutdown = post_shutdown
+    app.post_init = post_init
+    app.post_shutdown = post_shutdown
 
-    tg.run_webhook(
+    app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=path,
